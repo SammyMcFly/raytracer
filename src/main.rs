@@ -81,12 +81,12 @@ fn main() -> Result<(), Error>{
     // init img properties
     let imgx = 800;
     let imgy = 450;
-    let n_rays = 1E9 as u64;
-    // let n_rays_per_pixel = 2778 as u64;
+    // let n_rays = 1E9 as u64;
+    let n_rays_per_pixel = 3000;
     let n_threads: u8 = 10;
 
     // take look into scene
-    let colorstack = scene1.look(imgx, imgy, n_rays, n_threads);
+    let colorstack = scene1.look(imgx, imgy, n_rays_per_pixel, n_threads);
 
     // Write data to .png file
     // let _png: image::ImageBuffer<image::Rgb::<u8>, Vec<u8>> = colorstack.into();

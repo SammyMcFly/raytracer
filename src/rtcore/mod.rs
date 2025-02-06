@@ -280,25 +280,24 @@ impl ViewPoint {
     /// Ray,
     /// x position on ViewWindow (left is 0, right is width of window),
     /// y position on ViewWindow (bottom is 0, top is height of window)
-    fn create_rndm_ray_through_window(&self) -> (Ray, f64, f64) {
-        let width_range = self.window.size.0/2.0;
-        let height_range = self.window.size.1/2.0;
-
+    fn create_rndm_ray_through_pixel(&self, pixel_x: usize, pixel_y: usize, pixel_width: f64, pixel_height: f64) -> Ray {
         let rndm_pos = utilities::random_2d_pos(
-            -width_range..=width_range,
-            -height_range..=height_range);
-        let vec_center_window_to_rndm_pos_ = self.window.get_vector_from_center(
-            rndm_pos.0, rndm_pos.1);
+            0.0..=pixel_width,
+            0.0..=pixel_height);
+        // calculate pixel position (left-upper-corner)
+        let pixel_offset_from_center_x = -self.window.size.0/2.0+(pixel_x as f64)*pixel_width;
+        let pixel_offset_from_center_y = self.window.size.1/2.0-(pixel_y as f64)*pixel_height;
+        let vec_center_window_to_rndm_pos = self.window.get_vector_from_center(
+            pixel_offset_from_center_x+rndm_pos.0,
+            pixel_offset_from_center_y-rndm_pos.1);
 
         let direction_from_point_to_center_of_window = self.window.direction
             *self.distance_to_window_plane;
 
         let direction_from_point_to_rndm_pos_on_window =
-            direction_from_point_to_center_of_window + vec_center_window_to_rndm_pos_;
+            direction_from_point_to_center_of_window + vec_center_window_to_rndm_pos;
 
-        (Ray::new(self.point, direction_from_point_to_rndm_pos_on_window, RayColor::new_rndm()),
-        rndm_pos.0+width_range,
-        -rndm_pos.1+height_range)
+        Ray::new(self.point, direction_from_point_to_rndm_pos_on_window, RayColor::new_rndm())
     }
 }
 
@@ -506,18 +505,23 @@ impl Scene {
         // window_size: (f64, f64),
         res_x: u32,
         res_y: u32,
-        n_rays: u64,
+        rays_numbered: std::ops::Range<u64>,
         bar: Arc<ProgressBar>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let mut color_stack = ColorStack::new(res_x, res_y);
-            for i in 0..n_rays {
-                let (ray, window_intersec_x, window_intersec_y) = scene.view_point
-                    .create_rndm_ray_through_window();
+            // total number of pixels
+            let n_pixels = (res_x as u64)*(res_y as u64);
+            // calc width and height of a pixel
+            let pixel_width = scene.view_point.window.size.0/(res_x as f64);
+            let pixel_height = scene.view_point.window.size.1/(res_y as f64);
+            for i in rays_numbered {
+                // determine associated pixel (start top left in lines to bottom right)
+                let pixel_x = (i%res_x as u64) as usize;
+                let pixel_y = ((i/res_x as u64)%(res_y as u64)) as usize;
 
-                // assign to pixel
-                let pixel_x = (res_x as f64*window_intersec_x/scene.view_point.window.size.0) as usize;
-                let pixel_y = (res_y as f64*window_intersec_y/scene.view_point.window.size.1) as usize;
+                let ray = scene.view_point
+                    .create_rndm_ray_through_pixel(pixel_x, pixel_y, pixel_width, pixel_height);
 
                 // intersect ray with scene objects and eval intersections
                 if let Some(ray_data) = scene.trace_ray(&ray) {
@@ -525,8 +529,8 @@ impl Scene {
                 }
                 // color_stack.inc_height(pixel_x, pixel_y, ray.color);
 
-                if i%(n_rays/10) == (n_rays/10)-1 {
-                    bar.inc(n_rays/10);
+                if i%n_pixels == n_pixels-1 {
+                    bar.inc(1);
                 }
             }
             bar.abandon();
@@ -534,7 +538,7 @@ impl Scene {
             transmitter.send(color_stack).unwrap();
         })
     }
-    pub fn look(&self, res_x: u32, res_y: u32, n_rays: u64, n_threads: u8) -> ColorStack {
+    pub fn look(&self, res_x: u32, res_y: u32, n_rays_per_pixel: u64, n_threads: u8) -> ColorStack {
         // set starting time
         // let started = Instant::now();
 
@@ -547,18 +551,23 @@ impl Scene {
         let multi_p_bar = MultiProgress::new();
         let bar_style = ProgressStyle::with_template(
                 "[{elapsed_precise}]{wide_bar:.cyan/blue} {pos}/{len} rays [{eta_precise}]\n{msg}").unwrap();
-        let bar = Arc::new(multi_p_bar.add(ProgressBar::new(n_rays)));
+        let bar = Arc::new(multi_p_bar.add(ProgressBar::new(n_rays_per_pixel)));
         bar.set_style(bar_style.clone());
 
         // trace rays in thread
         let receiver = {
             let (transmitter, receiver) = mpsc::channel();
+            // Number of rays
+            let n_rays_total: u64 = (res_x as u64)*(res_y as u64)*n_rays_per_pixel;
+            let n_rays_per_thread = n_rays_total/(n_threads as u64);
+            let n_rays_per_thread_rest = n_rays_total%(n_threads as u64);
             for i in 0..n_threads {
                 // calculate number of rays computed by this thread
-                let n_rays = if (i as u64) < n_rays%(n_threads as u64) {
-                    n_rays/(n_threads as u64) + 1
+                let rays_numbered = if (i as u64) < n_rays_per_thread_rest {
+                    ((n_rays_per_thread+1)*(i as u64))..((n_rays_per_thread+1)*((i+1) as u64))
                 } else {
-                    n_rays/(n_threads as u64)
+                    (n_rays_per_thread*(i as u64)+n_rays_per_thread_rest)..(n_rays_per_thread*((i+1) as u64)
+                        +n_rays_per_thread_rest)
                 };
 
                 let transmitter = transmitter.clone();
@@ -570,7 +579,7 @@ impl Scene {
                     scene,
                     res_x,
                     res_y,
-                    n_rays,
+                    rays_numbered,
                     bar);
             }
             receiver
