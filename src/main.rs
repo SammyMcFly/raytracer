@@ -6,7 +6,7 @@
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::FmtSubscriber;
-use tracing::debug; // , error, info, span, trace, warn};
+use tracing::info; // , error, info, span, trace, warn, debug};
 
 use nalgebra::Vector3;
 
@@ -25,14 +25,27 @@ struct Args {
     /// File path to input .obj file
     #[arg(short, long, default_value = "./test_scene.obj")]
     object: String,
+    // /// Horizontal resolution
+    // /// Vertical resolution
+    /// Log severity level (Options: TRACE, DEBUG, INFO, WARN, ERROR, OFF)
+    #[arg(short, long, default_value_t=String::from("OFF"))]
+    log: String,
 }
 
 fn main() -> Result<(), Error>{
     // parse args
     let args = Args::parse();
     // init logging
+    let severity_level = match &args.log[..] {
+        "TRACE" => LevelFilter::TRACE,
+        "DEBUG" => LevelFilter::DEBUG,
+        "INFO" => LevelFilter::INFO,
+        "WARN" => LevelFilter::WARN,
+        "ERROR" => LevelFilter::ERROR,
+        _ => LevelFilter::OFF, // String::from("OFF")
+    };
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(LevelFilter::OFF)
+        .with_max_level(severity_level)
         .with_writer(std::io::stdout)
         .with_line_number(true)
         // .with_ansi(false)
@@ -40,6 +53,7 @@ fn main() -> Result<(), Error>{
         .finish();
         // .with(debug_log);
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set subscriber");
+    info!("Start rusty ray tracer");
 
     // import .obj file
     let (models, materials) =
@@ -57,10 +71,10 @@ fn main() -> Result<(), Error>{
         println!("Face normal indices: {:?}", model.mesh.normal_indices);
     }
 
-    match materials {
-        Ok(m) => { let _materials = m; },
-        Err(_) => { println!("Failed to load MTL file"); },
-    }
+    let materials = match materials {
+        Ok(m) => { Some(m) },
+        Err(_) => { println!("Failed to load MTL file"); None },
+    };
 
     // create scene
     let window = rtcore::ViewWindow::from(
@@ -72,17 +86,13 @@ fn main() -> Result<(), Error>{
         window,
         distance_to_window_plane: 2.0,
     };
-    let scene1 = rtcore::Scene {
-        view_point,
-        models,
-        // coordinate_system: CoordinateSystem::Cylindric,
-    };
+    let scene1 = rtcore::Scene::from(view_point, models, materials.unwrap(), 1);
 
     // init img properties
-    let imgx = 800;
-    let imgy = 450;
+    let imgx = 2560;
+    let imgy = 1440;
     // let n_rays = 1E9 as u64;
-    let n_rays_per_pixel = 3000;
+    let n_rays_per_pixel = 500;
     let n_threads: u8 = 10;
 
     // take look into scene

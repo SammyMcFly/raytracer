@@ -33,16 +33,34 @@ where
 
 /// Generate a random value between 0 and 1
 ///
+/// Upper bound is excluded
+///
 /// # Example
 /// ```rust
 /// let a = random();
-/// assert!(a <= 1);
+/// assert!(a < 1);
 /// assert!(a >= 0);
 /// ```
 pub fn random() -> f64 {
     let mut rng = rand::thread_rng();
 
     rng.gen_range(0.0..1.0)
+}
+
+/// Generate a random value between 0 and 1
+///
+/// Upper bound is included
+///
+/// # Example
+/// ```rust
+/// let a = random();
+/// assert!(a < 1);
+/// assert!(a >= 0);
+/// ```
+pub fn random_incl() -> f64 {
+    let mut rng = rand::thread_rng();
+
+    rng.gen_range(0.0..=1.0)
 }
 
 /// Generate a random value between 0 and 2

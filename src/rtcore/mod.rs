@@ -2,16 +2,19 @@
 //!
 //! All the most important structs, methods and functions that Rusty Ray Tracer builds on are defined here
 //!
+//! This ray tracer builds on the concept of path tracing with next event estimation:
+//! - stratification of reflected ray domain into light sources and indirect lighting (whole hemisphere)
+//! -
 //!
-//!
-use exr::prelude::WritableImage;
-use tracing::{debug, error, trace}; // debug, error, info, span, trace, warn};
+use objects::{BBVTNode, Intersection, Reflectance, Triangle};
+use tracing::{debug, error, info, trace}; // debug, error, info, span, trace, warn};
 use indicatif::{MultiProgress, ProgressBar, HumanDuration};
 use indicatif::style::ProgressStyle;
 
 use nalgebra::{Vector3, Matrix3};
 use nalgebra::Rotation3;
 
+use std::mem::swap;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -23,28 +26,16 @@ use std::f64::consts;
 
 
 pub mod utilities;
-pub mod objectslib;
+pub mod objects;
 
 
-#[derive(Debug, Clone, Copy)]
-pub enum RayColor {
-    Red,
-    Green,
-    Blue,
-}
 
-impl RayColor {
-    fn new_rndm() -> RayColor {
-        match utilities::random3() {
-            0 => { RayColor::Red },
-            1 => { RayColor::Green },
-            2 => { RayColor::Blue },
-            _ => {
-                error!("Invalid random value during RayColor init");
-                panic!("Invalid random value during RayColor init");
-            },
-        }
-    }
+
+type Color = Vector3<f64>;
+
+pub enum SampleWeighting {
+    Uniform,
+    Cosine,
 }
 
 /// Struct representation of a Ray that can be cast into a [[Scene]]
@@ -54,52 +45,72 @@ pub struct Ray {
     base: Vector3<f64>, // Redundant info if ray belongs to scene
     /// Normalized direction of Ray
     direction: Vector3<f64>, // scaled with scaling factor t
-    color: RayColor,
+    // color: RayColor,
+    n_bounces: u64,
 }
 
 impl Ray {
     /// Construct new Ray
-    fn new(base: Vector3<f64>, direction: Vector3<f64>, color: RayColor) -> Self {
+    fn new(base: Vector3<f64>, direction: Vector3<f64>, n_bounces: u64) -> Self {
         Self {
             base,
             direction: direction/direction.norm(),
-            color,
+            // color,
+            n_bounces,
         }
     }
-    /// Construct new Ray from base into a random direction defined by dir
-    pub fn new_into_hemisphere(base: Vector3<f64>, dir: Vector3<f64>, color: RayColor) -> Ray {
+    /// Construct new Ray from base into hemisphere defined by dir
+    ///
+    /// Direction is random and weighted according to "weighting"
+    pub fn new_into_hemisphere(base: Vector3<f64>, dir: Vector3<f64>,
+            n_bounces: u64, weighting: SampleWeighting) -> Ray {
+        info!("Creating new ray with random direction inside the hemisphere");
         let azimuthal = utilities::random()*2.0*consts::PI;
         // polar angle is not equally distributed over its range (distribution: sin(theta))
         // according to the inversion method the function that needs to be applied to uniform samples x between 0 and 1
         // so that they adhere to a sine distribution is arccos(1-x)
-        let polar = (1.0-utilities::random()).acos();
-        let mut rand_dir_in_hemisphere = match dir.dot(&Vector3::z_axis()) {
+        let polar = match weighting {
+            SampleWeighting::Uniform => (1.0-utilities::random()).acos(),
+            SampleWeighting::Cosine => (utilities::random().sqrt()).asin(),
+        };
+        trace!("Angles of ray creation: azimuthal = {azimuthal}, polar = {polar}");
+        trace!("{}", dir);
+        let mut rand_dir_in_hemisphere = match dir.dot(&Vector3::new(0.0, 0.0, 1.0)) {
             1.0 | -1.0 => {
                 let perp = Vector3::new(1.0, 0.0, 0.0);
                 let rot_perp = Rotation3::new(polar*perp);
                 let rot_para = Rotation3::new(azimuthal*dir/dir.norm());
+                trace!("{}", rot_para*(rot_perp*dir));
                 rot_para*(rot_perp*dir)
             },
             _ => {
                 let perp = dir.cross(&Vector3::z_axis());
                 let rot_perp = Rotation3::new(polar*perp/perp.norm());
                 let rot_para = Rotation3::new(azimuthal*dir/dir.norm());
+                trace!("{}", rot_para*(rot_perp*dir));
                 rot_para*(rot_perp*dir)
             },
         };
         rand_dir_in_hemisphere = rand_dir_in_hemisphere/rand_dir_in_hemisphere.norm();
         if dir.dot(&rand_dir_in_hemisphere) < 0.0 {
             error!("Created ray is not in hemisphere");
-            todo!("Created ray is not in hemisphere");
+            panic!("Created ray is not in hemisphere");
         }
-        trace!("{}", rand_dir_in_hemisphere.norm());
-        Ray {
+        trace!("Length of vector {}", rand_dir_in_hemisphere.norm());
+        Self::new(
             base,
-            direction: rand_dir_in_hemisphere, // /rand_dir_in_hemisphere.norm(),
-            color,
-        }
+            rand_dir_in_hemisphere,
+            n_bounces,
+        )
     }
-    fn intersect_triangle(&self, p0: Vector3<f64>, p1: Vector3<f64>, p2: Vector3<f64>) -> Option<(f64, f64, f64)> {
+    /// Intersect ray with triangle
+    ///
+    /// Return:
+    /// - scaling of ray t to intersection (>0)
+    /// - scaling of vector between p0 and p1 (to intersection)
+    /// - scaling of vector between p0 and p2 (to intersection)
+    fn intersect_triangle(&self, p0: &Vector3<f64>, p1: &Vector3<f64>, p2: &Vector3<f64>) -> Option<(f64, f64, f64)> {
+        info!("Intersecting ray with triangle");
         let s = self.base-p0;
         let e1 = p1-p0;
         let e2 = p2-p0;
@@ -109,24 +120,55 @@ impl Ray {
         let b2 = factor*s.cross(&e1).dot(&self.direction);
         if b1 >= 0.0 && b2 >= 0.0 && b1+b2 <= 1.0 && t > 0.0 {
             // intersection
+            info!("Found intersection between ray and triangle");
             return Some((t, b1, b2));
         }
+        info!("No intersection between ray and triangle found");
         None
     }
-    /// Check if a ray is absorbed depending on its color
-    pub fn is_absorbed(&self, refl: &objectslib::Reflectance) -> bool {
-        let random_val =  utilities::random();
-        match self.color {
-            RayColor::Red => { random_val >= refl.r },
-            RayColor::Green => { random_val >= refl.g },
-            RayColor::Blue => { random_val >= refl.b },
+    /// Intersect ray with (cubic, axis-aligned) bounding volume
+    ///
+    /// See: https://www.pbr-book.org/3ed-2018/Shapes/Basic_Shape_Interface#RayndashBoundsIntersections
+    ///
+    /// Return:
+    /// - scaling of ray t to intersection (>0)
+    /// - scaling of vector between p0 and p1 (to intersection)
+    /// - scaling of vector between p0 and p2 (to intersection)
+    fn intersect_bv(&self, bounds_min: Vector3<f64>, bounds_max: Vector3<f64>) -> bool {
+        let mut t_0: Option<f64> = None;
+        let mut t_1: Option<f64> = None;
+        for (i, (b_min_i, b_max_i)) in bounds_min.iter().zip(&bounds_max).enumerate() {
+            // inverse ray direction
+            let ray_dir_inv = 1.0/self.direction[i];
+            let mut t_near = (b_min_i-self.base[i])*ray_dir_inv;
+            let mut t_far = (b_max_i-self.base[i])*ray_dir_inv;
+            if t_near > t_far {
+                swap(&mut t_near, &mut t_far);
+            }
+            // update t_0
+            if let Some(val) = t_0 {
+                t_0 = if t_near > val { Some(t_near) } else { Some(val) };
+            } else {
+                t_0 = Some(t_near);
+            }
+            // update t_1
+            if let Some(val) = t_1 {
+                t_1 = if t_far < val { Some(t_far) } else { Some(val) };
+            } else {
+                t_1 = Some(t_far);
+            }
+            if t_0 > t_1 {
+                return false;
+            }
         }
+        t_1.unwrap() > 0.0
     }
 }
 
-
+/// 2D-Array that stores a [[Color]] for every pixel
+#[derive(Debug)]
 pub struct ColorStack {
-    accumulated_color: Vec<Vec<Vector3<f64>>>,
+    accumulated_color: Vec<Vec<Color>>,
     // height: Vec<Vec<Vector3<f64>>>,
 }
 
@@ -137,13 +179,6 @@ impl ColorStack {
             // height: vec![vec![Vector3::zeros(); dim_x as usize]; dim_y as usize],
         }
     }
-    // fn inc_height(&mut self, x: usize, y: usize, color: RayColor) {
-    //     match color {
-    //         RayColor::Red => self.height[y][x][0] += 1.0,
-    //         RayColor::Green => self.height[y][x][1] += 1.0,
-    //         RayColor::Blue => self.height[y][x][2] += 1.0,
-    //     }
-    // }
 }
 
 impl Add for ColorStack {
@@ -225,6 +260,7 @@ impl std::convert::Into<image::ImageBuffer<image::Rgb::<u8>, Vec<u8>>> for Color
 impl ColorStack {
     pub fn into_exr(self) -> exr::prelude::Image<exr::prelude::Layer<exr::prelude::SpecificChannels<impl Fn(exr::prelude::Vec2<usize>) -> (f32, f32, f32), (exr::prelude::ChannelDescription, exr::prelude::ChannelDescription, exr::prelude::ChannelDescription)>>>
     {
+        info!("Writing ColorStack to file");
         // Create a new image with resolution: res_x * res_y
         let colorstack = self.accumulated_color.clone();
         let channels = exr::prelude::SpecificChannels::rgb(move |pos: exr::prelude::Vec2<usize>| {
@@ -281,6 +317,7 @@ impl ViewPoint {
     /// x position on ViewWindow (left is 0, right is width of window),
     /// y position on ViewWindow (bottom is 0, top is height of window)
     fn create_rndm_ray_through_pixel(&self, pixel_x: usize, pixel_y: usize, pixel_width: f64, pixel_height: f64) -> Ray {
+        info!("Create random ray through pixel with index ({pixel_x},{pixel_y})");
         let rndm_pos = utilities::random_2d_pos(
             0.0..=pixel_width,
             0.0..=pixel_height);
@@ -297,7 +334,7 @@ impl ViewPoint {
         let direction_from_point_to_rndm_pos_on_window =
             direction_from_point_to_center_of_window + vec_center_window_to_rndm_pos;
 
-        Ray::new(self.point, direction_from_point_to_rndm_pos_on_window, RayColor::new_rndm())
+        Ray::new(self.point, direction_from_point_to_rndm_pos_on_window, 0)
     }
 }
 
@@ -311,192 +348,236 @@ impl ViewPoint {
 
 #[derive(Debug, Clone)]
 pub struct Scene {
-    pub view_point: ViewPoint,
+    view_point: ViewPoint,
+    // /// Collection of all 3D veritces in the scene represented by Vector3<f64>
+    // vertices: Vec<Arc<Vector3<f64>>>,
+    // /// Collection of all 3D normal vectors of surfaces represented by Vector3<f64>
+    // normals: Vec<Arc<Vector3<f64>>>,
+    // /// Collection of all surface materials
+    // materials: Vec<Arc<objects::Material>>,
+    /// Collection of all light sources
+    light_sources: Vec<objects::Triangle>,
+    // /// Collection of all triangle in the scene, they index 3 vertices, normals and materials
+    // // triangles: Vec<objectslib::Triangle>,
+    /// Collection of all light sources
     // light_sources: Vec<i8>,
-    pub models: Vec<tobj::Model>,
+    /// Binary bounding volume tree, which is searched for every intersection test
+    ///
+    /// Has all triangles of the scene as leafs
+    bbv_tree_root: objects::BBVTNode,
+    /// Maximum bounces a ray does in the scene until it is terminated
+    max_bounces: u64,
+
     // coordinate_system: CoordinateSystem,
 }
 
 impl Scene {
-    fn eval_intersection(
-        &self,
-        ray: &Ray,
-        model: &tobj::Model,
-        _triangle_indices: (usize, usize, usize),
-        normal_index: usize,
-        t_b1_b2: (f64, f64, f64)
-    ) -> Vector3<f64> {
-        // handle absorption randomly
-        // cast new ray
-        if model.name == "Plane1" {
-            let reflectance = objectslib::Reflectance::new(0.3, 0.3, 0.3);
-            // let face_normal = Vector3::from_vec(model.mesh.normals[0..=2]
-            //     .iter()
-            //     .map(|val| { *val as f64 } )
-            //     .collect());
-            // let ray_refl = Ray {
-            //     // intersection point
-            //     base: ray.base+ray.direction*t_b1_b2.0,
-            //     // reflected ray direction (omega_in = -ray:direction)
-            //     direction: -2.0*ray.direction.dot(&face_normal)*face_normal+ray.direction,
-            //     color: ray.color,
-            // };
-            // match self.trace_ray(&ray_refl){
-            //     Some(res) => {
-            //         res/2
-            //     },
-            //     None => {
-            //         Vector3::from([100, 100, 100])
-            //     }
-            // }
-            // check for absorption
-            if ray.is_absorbed(&reflectance) { // absorbed
-                Vector3::new(0.0, 0.0, 0.0)
-            } else { // not absorbed
-                let face_normal = Vector3::from_vec(model.mesh.normals[0..=2]
-                    .iter()
-                    .map(|val| { *val as f64 } )
-                    .collect());
-                let ray_refl =  Ray::new_into_hemisphere(
-                    ray.base+ray.direction*t_b1_b2.0,
-                    face_normal,
-                    ray.color);
-                match self.trace_ray(&ray_refl){
-                    Some(res) => {
-                        res/consts::PI
-                    },
-                    None => {
-                        Vector3::new(0.0, 0.0, 0.0)
-                    }
+    /// Create Scene
+    ///
+    /// models is expected to contain models consisting only of triangles and having a mdl.mesh.material_id
+    pub fn from(
+            view_point: ViewPoint,
+            models: Vec<tobj::Model>,
+            materials: Vec<tobj::Material>,
+            max_bounces: u64,
+    ) -> Self {
+        info!("Creating scene");
+        let mut materials_extracted = Vec::new();
+        for mat in materials {
+            let [r, g, b] = mat.diffuse.unwrap();
+            if mat.name.contains("light_source") {
+                let light_emission = Reflectance::from_vec(
+                    Vec::from(mat.ambient.unwrap()).iter().map(|a| *a as f64).collect());
+                materials_extracted.push(Arc::new(objects::Material::DiffuseLightSource {
+                    refl: Reflectance::new(r as f64, g as f64, b as f64),
+                    light_emission,
+                }));
+            } else {
+                materials_extracted.push(Arc::new(objects::Material::Diffuse {
+                    refl: Reflectance::new(r as f64, g as f64, b as f64),
+                }));
+            }
+        }
+
+        let mut vertices = Vec::new();
+        let mut normals = Vec::new();
+        let mut triangles = Vec::new();
+        let mut light_sources = Vec::new();
+        for mdl in models {
+            let mut vertices_i = Vec::new();
+            let mut normals_i = Vec::new();
+            for vertex in mdl.mesh.positions.chunks(3) {
+                vertices_i.push(Arc::new(Vector3::new(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64)));
+            }
+            for normal in mdl.mesh.normals.chunks(3) {
+                normals_i.push(Arc::new(Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64)));
+            }
+            for (vertex_indices, normal_indices) in mdl.mesh.indices.chunks(3)
+            .zip(mdl.mesh.normal_indices.chunks(3)){
+                let tr = objects::Triangle::new(
+                    vertices_i[vertex_indices[0] as usize].clone(),
+                    vertices_i[vertex_indices[1] as usize].clone(),
+                    vertices_i[vertex_indices[2] as usize].clone(),
+                    normals_i[normal_indices[0] as usize].clone(),
+                    normals_i[normal_indices[1] as usize].clone(),
+                    normals_i[normal_indices[2] as usize].clone(),
+                    materials_extracted[mdl.mesh.material_id.unwrap()].clone(),
+                );
+                triangles.push(tr.clone());
+                if materials_extracted[mdl.mesh.material_id.unwrap()].is_light_source() {
+                    light_sources.push(tr);
                 }
+
             }
-        } else if model.name == "Plane2" || model.name == "Plane3" {
-            let reflectance = objectslib::Reflectance::new(0.3, 0.3, 0.3);
-            // check for absorption
-            if ray.is_absorbed(&reflectance) { // absorbed
-                Vector3::new(0.0, 0.0, 0.0)
-            } else { // not absorbed
-                let face_normal = Vector3::from_vec(model.mesh.normals[0..=2]
-                    .iter()
-                    .map(|val| { *val as f64 } )
-                    .collect());
-                let ray_refl =  Ray::new_into_hemisphere(
-                    ray.base+ray.direction*t_b1_b2.0,
-                    face_normal,
-                    ray.color);
-                match self.trace_ray(&ray_refl){
-                    Some(res) => {
-                        res/consts::PI
-                    },
-                    None => {
-                        Vector3::new(0.0, 0.0, 0.0)
-                    }
-                }
-            }
-            // Vector3::from([100, 100, 150])
-        } else if model.name == "Ls" {
-            // let reflectance = Vector3::new(0.3, 0.3, 0.3);
-            match ray.color {
-                RayColor::Red => Vector3::from([1.0, 0.0, 0.0]),
-                RayColor::Green => Vector3::from([0.0, 1.0, 0.0]),
-                RayColor::Blue => Vector3::from([0.0, 0.0, 0.9]),
-            }
-        } else if model.name == "Cube" {
-            let reflectance = objectslib::Reflectance::new(0.9, 0.1, 0.1);
-            // check for absorption
-            if ray.is_absorbed(&reflectance) { // absorbed
-                Vector3::new(0.0, 0.0, 0.0)
-            } else { // not absorbed
-                let face_normal = Vector3::from_vec(model.mesh.normals[3*normal_index..=(3*normal_index+2)]
-                    .iter()
-                    .map(|val| { *val as f64 } )
-                    .collect());
-                let ray_refl =  Ray::new_into_hemisphere(
-                    ray.base+ray.direction*t_b1_b2.0,
-                    face_normal,
-                    ray.color);
-                trace!("{}, {}, {:?}, {}", normal_index, face_normal, ray_refl, face_normal.dot(&ray_refl.direction));
-                match self.trace_ray(&ray_refl){
-                    Some(res) => {
-                        res/consts::PI
-                    },
-                    None => {
-                        Vector3::new(0.0, 0.0, 0.0)
-                    }
-                }
-            }
-            // Vector3::from([255, 0, 0])
-        } else { // pro forma
-            error!("Could not evaluate intersection. Hit object not found");
-            Vector3::from([0.0, 0.0, 0.0])
+            vertices.extend(vertices_i);
+            normals.extend(normals_i);
+        }
+
+        // build bounding volume hierarchy
+        let bbv_tree_root = BBVTNode::build_bbv_tree(triangles);
+
+        debug!("Outer bounds: {:?}, {:?}", bbv_tree_root.bounds_min, bbv_tree_root.bounds_max);
+
+        Self {
+            view_point,
+            // vertices,
+            // normals,
+            // materials: materials_extracted,
+            light_sources,
+            bbv_tree_root,
+            max_bounces,
         }
     }
-    fn trace_ray(&self, ray: &Ray) -> Option<Vector3<f64>> {
-        // determine first intersection with an object
-        // init first intersection
-        let mut first_model: Option<&tobj::Model> = None;
-        let mut triangle_indices: Option<(usize, usize, usize)> = None;
-        let mut normal_index: Option<usize> = None;
-        let mut t_b1_b2: Option<(f64, f64, f64)> = None;
-        // go through all models
-        for model in &self.models {
-            if !&model.mesh.face_arities.is_empty() {
-                panic!("Found something else than a triangle");
-            }
-
-            // go through all triangles (only triangles are supported)
-            for (i, ind_tri) in model.mesh.indices.chunks(3).enumerate() {
-                // extract vertices
-                let p0 = Vector3::from([
-                    (model.mesh.positions[3*ind_tri[0] as usize]) as f64,
-                    (model.mesh.positions[(3*ind_tri[0] as usize)+1]) as f64,
-                    (model.mesh.positions[(3*ind_tri[0] as usize)+2]) as f64]);
-                let p1 = Vector3::from([
-                    (model.mesh.positions[3*ind_tri[1] as usize]) as f64,
-                    (model.mesh.positions[(3*ind_tri[1] as usize)+1]) as f64,
-                    (model.mesh.positions[(3*ind_tri[1] as usize)+2]) as f64]);
-                let p2 = Vector3::from([
-                    (model.mesh.positions[3*ind_tri[2] as usize]) as f64,
-                    (model.mesh.positions[(3*ind_tri[2] as usize)+1]) as f64,
-                    (model.mesh.positions[(3*ind_tri[2] as usize)+2]) as f64]);
-
-                // intersect ray with current triangle
-                if let Some((t, b1, b2)) = ray.intersect_triangle(p0, p1, p2) {
-                    match t_b1_b2 {
-                        Some(prev) => {
-                            if t < prev.0 {
-                                t_b1_b2 = Some((t, b1, b2));
-                                first_model = Some(model);
-                                triangle_indices = Some((
-                                    ind_tri[0] as usize,
-                                    ind_tri[1] as usize,
-                                    ind_tri[2] as usize));
-                                normal_index = Some(model.mesh.normal_indices[3*i] as usize);
-                            }
-                        },
-                        None => {
-                            t_b1_b2 = Some((t, b1, b2));
-                            first_model = Some(model);
-                            triangle_indices = Some((
-                                ind_tri[0] as usize,
-                                ind_tri[1] as usize,
-                                ind_tri[2] as usize));
-                            normal_index = Some(model.mesh.normal_indices[3*i] as usize);
-                        },
-                    }
+    /// Currently does not support normal vector interpolation
+    fn get_random_light_source(&self) -> (&objects::Triangle, f64) { // , reference_point: Vector3<f64>, triangle: objects::Triangle
+        // todo check that light source is not selected from the same light source
+        // // select light source, which face the reference point and are located in the hemisphere defined by
+        // // the reference point's normal vector
+        // let mut ls_candidates: Vec<Triangle> = Vec::new();
+        // for ls in &self.light_sources {
+        //     let mut connection_1 = Vector3::new(0.0, 0.0, 0.0);
+        //     ls.v1.sub_to(&reference_point, &mut connection_1);
+        //     let mut connection_2 = Vector3::new(0.0, 0.0, 0.0);
+        //     ls.v2.sub_to(&reference_point, &mut connection_2);
+        //     let mut connection_3 = Vector3::new(0.0, 0.0, 0.0);
+        //     ls.v3.sub_to(&reference_point, &mut connection_3);
+        //     if (ls.n1.dot(&connection_1) < 0.0 && connection_1.dot(&triangle.face_normal(&reference_point)) > 0.0)
+        //             || (ls.n2.dot(&connection_2) < 0.0 && connection_2.dot(&triangle.face_normal(&reference_point)) > 0.0)
+        //             || (ls.n3.dot(&connection_3) < 0.0 && connection_3.dot(&triangle.face_normal(&reference_point)) > 0.0) {
+        //         ls_candidates.push(ls.clone());
+        //     }
+        // }
+        let rndm_ls_index = (utilities::random()*self.light_sources.len() as f64) as usize;
+        let rndm_ls = &self.light_sources[rndm_ls_index];
+        (rndm_ls, 1.0/self.light_sources.len() as f64)
+    }
+    /// Evaluate intersection according to path tracing with next event estimation
+    ///
+    /// Terminate rays after max_bounces bounces
+    fn eval_intersection(
+        &self,
+        intersection: objects::Intersection,
+        light_emission: bool,
+    ) -> Vector3<f64> {
+        info!("Evaluating ray-scene-intersection: {intersection:?}, consider light emission: {light_emission}");
+        // init intersection point
+        let point_of_intersection = intersection.ray.base
+            +intersection.ray.direction*intersection.ray_scaling;
+        // eval intersection regarding direct lighting
+        let randiance_emitted = if light_emission && intersection.triangle.mat.is_light_source() {
+            Some(intersection.triangle.mat.light_emission())
+        } else {
+            None
+        };
+        // check number of bounces
+        let lighting = if intersection.ray.n_bounces > self.max_bounces { // terminate ray
+            Vector3::new(0.0, 0.0, 0.0)
+        } else { // continue tracing ray
+            // get face normal
+            let face_normal = intersection.triangle.face_normal(&point_of_intersection);
+            trace!("Face normal: {face_normal}");
+            // eval primary lighting
+            let (ls, probability_ls) = self.get_random_light_source();
+                // &point_of_intersection,
+                // &intersection.triangle);
+            let (rndm_point_on_ls, ray_to_ls, area) = ls
+                .random_point_on_surface(&point_of_intersection, intersection.ray.n_bounces);
+            let ls_intersection = Intersection {
+                ray: &ray_to_ls,
+                triangle: ls,
+                ray_scaling: (rndm_point_on_ls-point_of_intersection).norm(),
+            };
+            let ls_face_normal = ls.face_normal(&rndm_point_on_ls);
+            let randiance_direct = match self.trace_to_lightsource(&ray_to_ls, &ls_intersection){
+                Some(randiance_direct)
+                if ray_to_ls.direction.dot(&(face_normal/face_normal.norm())) > 0.0
+                && ray_to_ls.direction.dot(&(ls_face_normal/ls_face_normal.norm())) < 0.0 => {
+                    trace!("randiance from ls: {randiance_direct}");
+                    1.0/(probability_ls*1.0/area) // pdf
+                    *intersection.triangle.mat.brdf().component_mul(&randiance_direct) // brdf * radiance
+                    *ray_to_ls.direction.dot(&(face_normal/face_normal.norm())) // cos(omega_i, normal_p)
+                    *(-ray_to_ls.direction.dot(&(ls_face_normal/ls_face_normal.norm()))) // cos(-omega_i, normal_x)
+                    /ls_intersection.ray_scaling.powi(2) // devision by r^2
+                },
+                _ => {
+                    Vector3::new(0.0, 0.0, 0.0)
                 }
-            }
+            };
+            trace!("randiance from ls after surface interaction: {randiance_direct}");
+            // eval secondary lighting
+            let ray_refl =  Ray::new_into_hemisphere(
+                point_of_intersection,
+                face_normal,
+                intersection.ray.n_bounces+1,
+                SampleWeighting::Cosine);
+
+            let randiance_indirect = match self.trace(&ray_refl, false){
+                Some(randiance_indirect) => {
+                    1.0/ray_refl.direction.dot(&(face_normal/face_normal.norm())) // pdf
+                    *intersection.triangle.mat.brdf().component_mul(&randiance_indirect) // brdf * radiance
+                    *ray_refl.direction.dot(&(face_normal/face_normal.norm())) // cos(omega_i, normal_p)
+                },
+                None => {
+                    Vector3::new(0.0, 0.0, 0.0)
+                }
+            };
+            trace!("randiance from indirect lighting after surface interaction: {randiance_indirect}");
+            // combine with randiance_emitted
+            randiance_direct+randiance_indirect
+        };
+        // combine lighting and randiance_emitted
+        if let Some(randiance_emitted) = randiance_emitted {
+            debug!("Ray-scene-intersection evaluated: radiance = {}", randiance_emitted + lighting);
+            randiance_emitted + lighting
+        } else {
+            debug!("Ray-scene-intersection evaluated: radiance = {}", lighting);
+            lighting
         }
-        // evaluate first intersection
-        if let Some(fm) = first_model {
+    }
+    /// Trace ray into the scene
+    ///
+    /// Intersect ray with the scene, split ray according to stratification rules and evaluate intersections with scene.
+    fn trace(&self, ray: &Ray, eval_light_emission: bool) -> Option<Vector3<f64>> {
+        info!("Tracing ray: {ray:?}");
+        // determine first intersection with an object and evaluate it in case it exists
+        if let Some(intersec) = self.bbv_tree_root.intersect(ray) {
             return Some(self.eval_intersection(
-                ray,
-                fm,
-                triangle_indices.unwrap(),
-                normal_index.unwrap(),
-                t_b1_b2.unwrap()));
+                intersec,
+                eval_light_emission));
         }
         None
+    }
+    fn trace_to_lightsource(&self, ray: &Ray, intersection: &objects::Intersection) -> Option<Vector3<f64>> {
+        info!("Tracing ray to light source: {ray:?}");
+        // check if lightsource is concealed by other object
+        if self.bbv_tree_root.is_concealed(ray, intersection.ray_scaling) { // if true, do not do anything
+            debug!("Light source is concealed");
+            None
+        } else { // since is not concealed eval intersection with ls
+            debug!("Direct connection between light source and ray origin exists");
+            // todo check orientation of ray and ls
+            Some(intersection.triangle.mat.light_emission())
+        }
     }
     fn trace_rays_in_new_thread(
         transmitter: mpsc::Sender<ColorStack>,
@@ -509,22 +590,24 @@ impl Scene {
         bar: Arc<ProgressBar>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            info!("Tracing ray number {rays_numbered:?} in new thread");
             let mut color_stack = ColorStack::new(res_x, res_y);
             // total number of pixels
             let n_pixels = (res_x as u64)*(res_y as u64);
             // calc width and height of a pixel
             let pixel_width = scene.view_point.window.size.0/(res_x as f64);
             let pixel_height = scene.view_point.window.size.1/(res_y as f64);
-            for i in rays_numbered {
+            for i in rays_numbered.clone() {
                 // determine associated pixel (start top left in lines to bottom right)
                 let pixel_x = (i%res_x as u64) as usize;
                 let pixel_y = ((i/res_x as u64)%(res_y as u64)) as usize;
 
                 let ray = scene.view_point
                     .create_rndm_ray_through_pixel(pixel_x, pixel_y, pixel_width, pixel_height);
+                debug!("Created ray: {ray:?}");
 
                 // intersect ray with scene objects and eval intersections
-                if let Some(ray_data) = scene.trace_ray(&ray) {
+                if let Some(ray_data) = scene.trace(&ray, true) {
                     color_stack.accumulated_color[pixel_y][pixel_x] += ray_data;
                 }
                 // color_stack.inc_height(pixel_x, pixel_y, ray.color);
@@ -534,11 +617,13 @@ impl Scene {
                 }
             }
             bar.abandon();
+            info!("Finished tracing ray number {rays_numbered:?}");
             // send result
             transmitter.send(color_stack).unwrap();
         })
     }
     pub fn look(&self, res_x: u32, res_y: u32, n_rays_per_pixel: u64, n_threads: u8) -> ColorStack {
+        info!("Looking into scene with resolution {res_x}x{res_y} and {n_rays_per_pixel} ray per pixel");
         // set starting time
         // let started = Instant::now();
 
