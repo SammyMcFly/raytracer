@@ -231,7 +231,7 @@ impl std::convert::Into<image::ImageBuffer<image::Rgb::<u8>, Vec<u8>>> for Color
                 self.accumulated_color[0].len().try_into().unwrap(),
                 self.accumulated_color.len().try_into().unwrap());
 
-            // Populate the image bugger with the
+            // Populate the image buffer with the
             for (x, y, pixel) in imgbuf.enumerate_pixels_mut() {
                 // let height_x_y_r = color_stack.height[y as usize][x as usize][0];
                 // let height_x_y_g = color_stack.height[y as usize][x as usize][1];
@@ -365,8 +365,6 @@ pub struct Scene {
     ///
     /// Has all triangles of the scene as leafs
     bbv_tree_root: objects::BBVTNode,
-    /// Maximum bounces a ray does in the scene until it is terminated
-    max_bounces: u64,
 
     // coordinate_system: CoordinateSystem,
 }
@@ -379,7 +377,6 @@ impl Scene {
             view_point: ViewPoint,
             models: Vec<tobj::Model>,
             materials: Vec<tobj::Material>,
-            max_bounces: u64,
     ) -> Self {
         info!("Creating scene");
         let mut materials_extracted = Vec::new();
@@ -445,7 +442,6 @@ impl Scene {
             // materials: materials_extracted,
             light_sources,
             bbv_tree_root,
-            max_bounces,
         }
     }
     /// Currently does not support normal vector interpolation
@@ -478,6 +474,7 @@ impl Scene {
         &self,
         intersection: objects::Intersection,
         light_emission: bool,
+        max_bounces: u64,
     ) -> Vector3<f64> {
         info!("Evaluating ray-scene-intersection: {intersection:?}, consider light emission: {light_emission}");
         // init intersection point
@@ -490,7 +487,7 @@ impl Scene {
             None
         };
         // check number of bounces
-        let lighting = if intersection.ray.n_bounces > self.max_bounces { // terminate ray
+        let lighting = if intersection.ray.n_bounces > max_bounces { // terminate ray
             Vector3::new(0.0, 0.0, 0.0)
         } else { // continue tracing ray
             // get face normal
@@ -531,7 +528,10 @@ impl Scene {
                 intersection.ray.n_bounces+1,
                 SampleWeighting::Cosine);
 
-            let randiance_indirect = match self.trace(&ray_refl, false){
+            let randiance_indirect = match self.trace(
+                    &ray_refl,
+                    false,
+                    max_bounces){
                 Some(randiance_indirect) => {
                     1.0/ray_refl.direction.dot(&(face_normal/face_normal.norm())) // pdf
                     *intersection.triangle.mat.brdf().component_mul(&randiance_indirect) // brdf * radiance
@@ -557,13 +557,14 @@ impl Scene {
     /// Trace ray into the scene
     ///
     /// Intersect ray with the scene, split ray according to stratification rules and evaluate intersections with scene.
-    fn trace(&self, ray: &Ray, eval_light_emission: bool) -> Option<Vector3<f64>> {
+    fn trace(&self, ray: &Ray, eval_light_emission: bool, max_bounces: u64) -> Option<Vector3<f64>> {
         info!("Tracing ray: {ray:?}");
         // determine first intersection with an object and evaluate it in case it exists
         if let Some(intersec) = self.bbv_tree_root.intersect(ray) {
             return Some(self.eval_intersection(
                 intersec,
-                eval_light_emission));
+                eval_light_emission,
+                max_bounces));
         }
         None
     }
@@ -587,6 +588,7 @@ impl Scene {
         res_x: u32,
         res_y: u32,
         rays_numbered: std::ops::Range<u64>,
+        max_bounces: u64,
         bar: Arc<ProgressBar>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
@@ -607,7 +609,7 @@ impl Scene {
                 debug!("Created ray: {ray:?}");
 
                 // intersect ray with scene objects and eval intersections
-                if let Some(ray_data) = scene.trace(&ray, true) {
+                if let Some(ray_data) = scene.trace(&ray, true, max_bounces) {
                     color_stack.accumulated_color[pixel_y][pixel_x] += ray_data;
                 }
                 // color_stack.inc_height(pixel_x, pixel_y, ray.color);
@@ -622,7 +624,8 @@ impl Scene {
             transmitter.send(color_stack).unwrap();
         })
     }
-    pub fn look(&self, res_x: u32, res_y: u32, n_rays_per_pixel: u64, n_threads: u8) -> ColorStack {
+    /// Render image of the scene by tracing rays
+    pub fn look(&self, res_x: u32, res_y: u32, n_rays_per_pixel: u64, max_bounces: u64, n_threads: u8) -> ColorStack {
         info!("Looking into scene with resolution {res_x}x{res_y} and {n_rays_per_pixel} ray per pixel");
         // set starting time
         // let started = Instant::now();
@@ -665,6 +668,7 @@ impl Scene {
                     res_x,
                     res_y,
                     rays_numbered,
+                    max_bounces,
                     bar);
             }
             receiver

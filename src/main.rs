@@ -86,17 +86,18 @@ fn main() -> Result<(), Error>{
         window,
         distance_to_window_plane: 2.0,
     };
-    let scene1 = rtcore::Scene::from(view_point, models, materials.unwrap(), 1);
+    let scene1 = rtcore::Scene::from(view_point, models, materials.unwrap());
 
     // init img properties
-    let imgx = 2560;
-    let imgy = 1440;
+    let imgx = 2560/2;
+    let imgy = 1440/2;
+    let max_bounces = 1;
     // let n_rays = 1E9 as u64;
-    let n_rays_per_pixel = 500;
+    let n_rays_per_pixel = 100;
     let n_threads: u8 = 10;
 
     // take look into scene
-    let colorstack = scene1.look(imgx, imgy, n_rays_per_pixel, n_threads);
+    let colorstack = scene1.look(imgx, imgy, n_rays_per_pixel, max_bounces, n_threads);
 
     // Write data to .png file
     // let _png: image::ImageBuffer<image::Rgb::<u8>, Vec<u8>> = colorstack.into();
