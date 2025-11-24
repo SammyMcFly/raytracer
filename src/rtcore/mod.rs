@@ -15,9 +15,9 @@ use nalgebra::{Vector3, Matrix3};
 use nalgebra::Rotation3;
 
 use std::mem::swap;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
+use rayon::prelude::*;
 
 use std::time::Instant;
 use std::ops::{Add, AddAssign};
@@ -173,7 +173,7 @@ pub struct ColorStack {
 }
 
 impl ColorStack {
-    fn new(dim_x: u32, dim_y: u32) -> Self {
+    fn new(dim_x: usize, dim_y: usize) -> Self {
         ColorStack {
             accumulated_color: vec![vec![Vector3::zeros(); dim_x as usize]; dim_y as usize],
             // height: vec![vec![Vector3::zeros(); dim_x as usize]; dim_y as usize],
@@ -192,7 +192,7 @@ impl Add for ColorStack {
         || self.accumulated_color[0].len() != other.accumulated_color[0].len() {
             panic!("Cannot add two instances of ColorStack with different dimensions")
         }
-        let mut result = Self::new(self.accumulated_color[0].len() as u32, self.accumulated_color.len() as u32);
+        let mut result = Self::new(self.accumulated_color[0].len(), self.accumulated_color.len());
         for i in 0..self.accumulated_color.len() {
             for j in 0..self.accumulated_color[0].len() {
                 result.accumulated_color[i][j] = self.accumulated_color[i][j] + other.accumulated_color[i][j];
@@ -212,7 +212,7 @@ impl AddAssign for ColorStack {
         || self.accumulated_color[0].len() != other.accumulated_color[0].len() {
             panic!("Cannot add two instances of ColorStack with different dimensions")
         }
-        let mut result = Self::new(self.accumulated_color[0].len() as u32, self.accumulated_color.len() as u32);
+        let mut result = Self::new(self.accumulated_color[0].len(), self.accumulated_color.len());
         for i in 0..self.accumulated_color.len() {
             for j in 0..self.accumulated_color[0].len() {
                 result.accumulated_color[i][j] = self.accumulated_color[i][j] + other.accumulated_color[i][j];
@@ -277,6 +277,24 @@ impl ColorStack {
             )
         );
         image
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Tile {
+    x_start: usize,
+    y_start: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Tile {
+    fn x_range(&self) -> std::ops::Range<usize> {
+        self.x_start..(self.x_start + self.width)
+    }
+
+    fn y_range(&self) -> std::ops::Range<usize> {
+        self.y_start..(self.y_start + self.height)
     }
 }
 
@@ -580,112 +598,135 @@ impl Scene {
             Some(intersection.triangle.mat.light_emission())
         }
     }
-    fn trace_rays_in_new_thread(
-        transmitter: mpsc::Sender<ColorStack>,
+    fn trace_rays_in_tile(
+        transmitter: &mut crossbeam::channel::Sender<ColorStack>,
         scene: Arc<Self>,
+        tile: &Tile,
         // scene: Self,
         // window_size: (f64, f64),
-        res_x: u32,
-        res_y: u32,
-        rays_numbered: std::ops::Range<u64>,
+        res_x: usize,
+        res_y: usize,
+        // rays_numbered: std::ops::Range<u64>,
+        n_rays_per_pixel: u64,
         max_bounces: u64,
         bar: Arc<ProgressBar>,
-    ) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            info!("Tracing ray number {rays_numbered:?} in new thread");
-            let mut color_stack = ColorStack::new(res_x, res_y);
-            // total number of pixels
-            let n_pixels = (res_x as u64)*(res_y as u64);
-            // calc width and height of a pixel
-            let pixel_width = scene.view_point.window.size.0/(res_x as f64);
-            let pixel_height = scene.view_point.window.size.1/(res_y as f64);
-            for i in rays_numbered.clone() {
-                // determine associated pixel (start top left in lines to bottom right)
-                let pixel_x = (i%res_x as u64) as usize;
-                let pixel_y = ((i/res_x as u64)%(res_y as u64)) as usize;
+    ) {
+        info!("Tracing tile {tile:?} in new thread");
+        let mut color_stack = ColorStack::new(res_x, res_y);
+        // calc width and height of a pixel
+        let pixel_width = scene.view_point.window.size.0/(res_x as f64);
+        let pixel_height = scene.view_point.window.size.1/(res_y as f64);
+        // trace all rays in tile
+        for pixel_x in tile.x_range() {
+            for pixel_y in tile.y_range() {
+                for _ in 0..n_rays_per_pixel {
+                    let ray = scene.view_point
+                        .create_rndm_ray_through_pixel(pixel_x, pixel_y, pixel_width, pixel_height);
+                    debug!("Created ray: {ray:?}");
 
-                let ray = scene.view_point
-                    .create_rndm_ray_through_pixel(pixel_x, pixel_y, pixel_width, pixel_height);
-                debug!("Created ray: {ray:?}");
-
-                // intersect ray with scene objects and eval intersections
-                if let Some(ray_data) = scene.trace(&ray, true, max_bounces) {
-                    color_stack.accumulated_color[pixel_y][pixel_x] += ray_data;
-                }
-                // color_stack.inc_height(pixel_x, pixel_y, ray.color);
-
-                if i%n_pixels == n_pixels-1 {
-                    bar.inc(1);
+                    // intersect ray with scene objects and eval intersections
+                    if let Some(ray_data) = scene.trace(&ray, true, max_bounces) {
+                        color_stack.accumulated_color[pixel_y][pixel_x] += ray_data;
+                    }
                 }
             }
-            bar.abandon();
-            info!("Finished tracing ray number {rays_numbered:?}");
-            // send result
-            transmitter.send(color_stack).unwrap();
-        })
+        }
+        bar.inc(1);
+        bar.abandon();
+        info!("Finished tracing tile {tile:?}");
+        // send result
+        transmitter.send(color_stack).unwrap();
     }
+
+    /// Create tiles, which act as chunks that are computed by separate threads
+    fn make_tiles(img_width: usize, img_height: usize, tile_width: usize, tile_height: usize) -> Vec<Tile> {
+        let mut tiles = Vec::new();
+
+        let mut y = 0;
+        while y < img_height {
+            let mut x = 0;
+            while x < img_width {
+                let w = tile_width.min(img_width - x);   // Handle right edge
+                let h = tile_height.min(img_height - y); // Handle bottom edge
+
+                tiles.push(Tile {
+                    x_start: x,
+                    y_start: y,
+                    width: w,
+                    height: h,
+                });
+
+                x += tile_width;
+            }
+            y += tile_height;
+        }
+
+        tiles
+    }
+
     /// Render image of the scene by tracing rays
-    pub fn look(&self, res_x: u32, res_y: u32, n_rays_per_pixel: u64, max_bounces: u64, n_threads: u8) -> ColorStack {
+    pub fn look(
+        &self,
+        res_x: usize,
+        res_y: usize,
+        n_rays_per_pixel: u64,
+        max_bounces: u64,
+        channel_bound: usize,
+        tile_size: usize,
+    ) -> ColorStack {
         info!("Looking into scene with resolution {res_x}x{res_y} and {n_rays_per_pixel} ray per pixel");
         // set starting time
-        // let started = Instant::now();
+        let started = Instant::now();
 
         // create pointer to scene
         // Note: Copying scene for independent computing does not seem worth at all
         // (no computation time improvement at this stage)
         let scene = Arc::new(self.clone());
 
+        let tiles = Self::make_tiles(res_x, res_y, tile_size, tile_size);
+
         // init progress bar (for optimum performance remove bar)
         let multi_p_bar = MultiProgress::new();
         let bar_style = ProgressStyle::with_template(
-                "[{elapsed_precise}]{wide_bar:.cyan/blue} {pos}/{len} rays [{eta_precise}]\n{msg}").unwrap();
-        let bar = Arc::new(multi_p_bar.add(ProgressBar::new(n_rays_per_pixel)));
+                "[{elapsed_precise}]{wide_bar:.cyan/blue} {pos}/{len} tiles [{eta_precise}]\n{msg}").unwrap();
+        let bar = Arc::new(multi_p_bar.add(ProgressBar::new(tiles.len() as u64)));
         bar.set_style(bar_style.clone());
 
-        // trace rays in thread
-        let receiver = {
-            let (transmitter, receiver) = mpsc::channel();
-            // Number of rays
-            let n_rays_total: u64 = (res_x as u64)*(res_y as u64)*n_rays_per_pixel;
-            let n_rays_per_thread = n_rays_total/(n_threads as u64);
-            let n_rays_per_thread_rest = n_rays_total%(n_threads as u64);
-            for i in 0..n_threads {
-                // calculate number of rays computed by this thread
-                let rays_numbered = if (i as u64) < n_rays_per_thread_rest {
-                    ((n_rays_per_thread+1)*(i as u64))..((n_rays_per_thread+1)*((i+1) as u64))
-                } else {
-                    (n_rays_per_thread*(i as u64)+n_rays_per_thread_rest)..(n_rays_per_thread*((i+1) as u64)
-                        +n_rays_per_thread_rest)
-                };
+        let (transmitter, receiver) = crossbeam::channel::bounded(channel_bound);
 
-                let transmitter = transmitter.clone();
-                let scene = Arc::clone(&scene);
-                let bar = Arc::clone(&bar);
+        // run consumer that adds results up to a final rendered color stack
+        let handle = std::thread::spawn(move || {
+            // initialize accumulated color matrix that will later be used to populate the image buffer
+            let mut color_stack = ColorStack::new(res_x, res_y);
 
-                Self::trace_rays_in_new_thread(
-                    transmitter,
-                    scene,
-                    res_x,
-                    res_y,
-                    rays_numbered,
-                    max_bounces,
-                    bar);
+            // receive messages until all transmitters are dropped (and processes are finished)
+            for rcv_msg in receiver.iter() {
+                color_stack += rcv_msg;
             }
-            receiver
-        };
+            color_stack
+        });
 
-        // initialize accumulated color matrix that will later be used to populate the image buffer
-        let mut color_stack = ColorStack::new(res_x, res_y);
+        // trace rays threaded
+        tiles.par_iter().for_each_with(transmitter, |transmitter, tile| {
+            let scene = Arc::clone(&scene);
+            let bar = Arc::clone(&bar);
+            Self::trace_rays_in_tile(
+                transmitter,
+                scene,
+                tile,
+                res_x,
+                res_y,
+                n_rays_per_pixel,
+                max_bounces,
+                bar);
+        });
 
-        // receive messages until all transmitters are dropped (and processes are finished)
-        for rcv_msg in receiver.iter() {
-            color_stack += rcv_msg;
-        }
+        let total_color_stack = handle.join().unwrap();
 
         // multi_p_bar..clear().unwrap();
-        // println!("Finished evaluating {} rays in {}", n_rays, HumanDuration(started.elapsed()));
+        println!("Finished evaluating {} rays in {}", (res_x as u64)*(res_y as u64)*n_rays_per_pixel, started.elapsed().as_millis());
         println!("Finished... ");
 
-        color_stack
+        total_color_stack
     }
 }

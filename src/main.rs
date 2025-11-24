@@ -89,15 +89,16 @@ fn main() -> Result<(), Error>{
     let scene1 = rtcore::Scene::from(view_point, models, materials.unwrap());
 
     // init img properties
-    let imgx = 2560/2;
-    let imgy = 1440/2;
-    let max_bounces = 1;
+    let imgx = 2560;
+    let imgy = 1440;
+    let max_bounces = 10;
     // let n_rays = 1E9 as u64;
     let n_rays_per_pixel = 100;
-    let n_threads: u8 = 10;
+    let channel_bound: usize = 12; // number of cores is a good choice
+    let tile_size = 110;
 
     // take look into scene
-    let colorstack = scene1.look(imgx, imgy, n_rays_per_pixel, max_bounces, n_threads);
+    let colorstack = scene1.look(imgx, imgy, n_rays_per_pixel, max_bounces, channel_bound, tile_size);
 
     // Write data to .png file
     // let _png: image::ImageBuffer<image::Rgb::<u8>, Vec<u8>> = colorstack.into();
