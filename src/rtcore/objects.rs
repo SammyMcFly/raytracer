@@ -71,7 +71,7 @@ impl Triangle {
         // note: a scales self.v1, b scales self.v2, c scales self.v3 to arrive at point "at"
         a*(*self.n1)+b*(*self.n2)+c*(*self.n3)
     }
-    pub fn random_point_on_surface(&self, reference_point: &Vector3<f64>, n_bounces: u64) -> (Vector3<f64>, Ray, f64) {
+    pub fn random_point_on_surface(&self, reference_point: &Vector3<f64>, n_bounces: u64) -> (Vector3<f64>, Ray, f64, f64, f64) {
         // calculate area of triangle
         let mut e1 = Vector3::new(0.0, 0.0, 0.0);
         self.v2.sub_to(&*self.v1, &mut e1);
@@ -97,10 +97,17 @@ impl Triangle {
             *reference_point,
             rndm_point-reference_point,
             n_bounces+1);
-        (rndm_point, ray_to_rndm_p, area)
+        (rndm_point, ray_to_rndm_p, area, rndm_number_1, rndm_number_2)
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum BacksideIntersection {
+    #[allow(dead_code)]
+    Ignore,
+    #[allow(dead_code)]
+    EndRay,
+}
 
 /// Struct that contains every information important to a intersection
 #[derive(Debug, Clone)]
@@ -108,6 +115,39 @@ pub struct Intersection<'a> {
     pub ray: &'a Ray,
     pub triangle: &'a Triangle,
     pub ray_scaling: f64,
+    pub normal: Vector3<f64>,
+}
+
+impl<'a> Intersection<'a> {
+    pub fn new(
+        ray: &'a Ray,
+        triangle: &'a Triangle,
+        ray_scaling: f64,
+        b1: f64,
+        b2: f64,
+    ) -> Self {
+        Intersection {
+            ray,
+            triangle,
+            ray_scaling,
+            normal: Self::get_interpolated_normal(b1, b2, &triangle.n1, &triangle.n2, &triangle.n3),
+        }
+    }
+
+    pub fn get_interpolated_normal(
+        b1: f64,
+        b2: f64,
+        n1: &Vector3<f64>,
+        n2: &Vector3<f64>,
+        n3: &Vector3<f64>
+    ) -> Vector3<f64> {
+        let b0 = 1.0 - b1 - b2;
+        (b0 * n1 + b1 * n2 + b2 * n3).normalize()
+    }
+
+    pub fn from_front(&self) -> bool {
+        self.ray.direction.dot(&self.normal) < 0.0
+    }
 }
 
 /// Axis that devides a [[BBVTLeafPartition]]
@@ -286,21 +326,35 @@ enum BBVTNodeChild {
 }
 
 impl BBVTNodeChild {
-    fn intersect<'a>(&'a self, ray: &'a Ray) -> Option<Intersection<'a>> {
+    fn intersect<'a>(&'a self, ray: &'a Ray, backside_intersection: &BacksideIntersection) -> Option<Intersection<'a>> {
         match self {
             BBVTNodeChild::Node(node) => {
-                node.intersect(ray)
+                node.intersect(ray, backside_intersection)
             },
             BBVTNodeChild::Triangle(tri) => {
-                if let Some((t, _, _)) = ray.intersect_triangle(&tri.v1, &tri.v2, &tri.v3) {
-                    Some(Intersection {
-                        ray,
-                        triangle: tri,
-                        ray_scaling: t,
-                    })
-                } else {
-                    None
+                if let Some((t, b1, b2)) = ray.intersect_triangle(
+                    &tri.v1,
+                    &tri.v2,
+                    &tri.v3,
+                ) {
+                    match backside_intersection {
+                        BacksideIntersection::Ignore => {
+                            let intersection = Intersection::new(
+                                ray,
+                                tri,
+                                t,
+                                b1, b2,
+                            );
+                            if intersection.from_front() {
+                                return Some(Intersection::new(ray, tri, t, b1, b2));
+                            }
+                        },
+                        BacksideIntersection::EndRay => {
+                            return Some(Intersection::new(ray, tri, t, b1, b2));
+                        },
+                    }
                 }
+                None
             },
         }
     }
@@ -310,8 +364,15 @@ impl BBVTNodeChild {
                 return node.is_concealed(ray, ray_scaling);
             },
             BBVTNodeChild::Triangle(tri) => {
-                if let Some((t, _, _)) = ray.intersect_triangle(&tri.v1, &tri.v2, &tri.v3) {
-                    if t < ray_scaling {
+                if let Some((t, b1, b2)) = ray.intersect_triangle(
+                    &tri.v1,
+                    &tri.v2,
+                    &tri.v3,
+                ) {
+                    let interpolated_n = Intersection::get_interpolated_normal(b1, b2, &tri.n1, &tri.n2, &tri.n3);
+                    // Test if hitting from the direction the normal points in
+                    let is_front_face = ray.direction.dot(&interpolated_n) < 0.0;
+                    if !is_front_face || t < ray_scaling {
                         return true;
                     }
                 }
@@ -365,13 +426,17 @@ impl BBVTNode {
             bounds_max,
         }
     }
-    pub fn intersect<'a>(&'a self, ray: &'a Ray) -> Option<Intersection<'a>> {
+    pub fn intersect<'a>(
+        &'a self,
+        ray: &'a Ray,
+        backside_intersection: &BacksideIntersection,
+    ) -> Option<Intersection<'a>> {
         info!("Intersecting ray with BV");
         // test if ray enters bounding volume
         if ray.intersect_bv(self.bounds_min, self.bounds_max) {
             debug!("Intersection found");
             // if yes: Test Children
-            match (self.child1.intersect(ray), self.child2.intersect(ray)) {
+            match (self.child1.intersect(ray, backside_intersection), self.child2.intersect(ray, backside_intersection)) {
                 (Some(intersec_1), Some(intersec_2)) => {
                     if intersec_1.ray_scaling < intersec_2.ray_scaling {
                         return Some(intersec_1);

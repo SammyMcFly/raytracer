@@ -3,38 +3,38 @@
 //! All the most important structs, methods and functions that Rusty Ray Tracer builds on are defined here
 //!
 //! This ray tracer builds on the concept of path tracing with next event estimation:
-//! - stratification of reflected ray domain into light sources and indirect lighting (whole hemisphere)
+//! - stratification of incoming radiance domain into light sources and indirect lighting (whole hemisphere)
 //! -
 //!
-use objects::{BBVTNode, Intersection, Reflectance, Triangle};
-use tracing::{debug, error, info, trace}; // debug, error, info, span, trace, warn};
-use indicatif::{MultiProgress, ProgressBar, HumanDuration};
+use objects::{BBVTNode, Intersection, Reflectance};
+use tracing::{debug, info, trace}; // debug, error, info, span, trace, warn};
+use indicatif::{MultiProgress, ProgressBar};
 use indicatif::style::ProgressStyle;
 
-use nalgebra::{Vector3, Matrix3};
-use nalgebra::Rotation3;
+use nalgebra::{Vector3};
 
 use std::mem::swap;
 use std::sync::Arc;
-use std::thread;
 use rayon::prelude::*;
 
 use std::time::Instant;
 use std::ops::{Add, AddAssign};
 use core::panic;
-use std::f64::consts;
+use std::f64::consts::{self};
 
 
 pub mod utilities;
 pub mod objects;
 
-
+use objects::BacksideIntersection;
 
 
 type Color = Vector3<f64>;
 
 pub enum SampleWeighting {
+    #[allow(dead_code)]
     Uniform,
+    #[allow(dead_code)]
     Cosine,
 }
 
@@ -59,6 +59,7 @@ impl Ray {
             n_bounces,
         }
     }
+
     /// Construct new Ray from base into hemisphere defined by dir
     ///
     /// Direction is random and weighted according to "weighting"
@@ -75,57 +76,73 @@ impl Ray {
         };
         trace!("Angles of ray creation: azimuthal = {azimuthal}, polar = {polar}");
         trace!("{}", dir);
-        let mut rand_dir_in_hemisphere = match dir.dot(&Vector3::new(0.0, 0.0, 1.0)) {
-            1.0 | -1.0 => {
-                let perp = Vector3::new(1.0, 0.0, 0.0);
-                let rot_perp = Rotation3::new(polar*perp);
-                let rot_para = Rotation3::new(azimuthal*dir/dir.norm());
-                trace!("{}", rot_para*(rot_perp*dir));
-                rot_para*(rot_perp*dir)
-            },
-            _ => {
-                let perp = dir.cross(&Vector3::z_axis());
-                let rot_perp = Rotation3::new(polar*perp/perp.norm());
-                let rot_para = Rotation3::new(azimuthal*dir/dir.norm());
-                trace!("{}", rot_para*(rot_perp*dir));
-                rot_para*(rot_perp*dir)
-            },
+        let hemisphere_vertical = dir.normalize();
+
+        let hemisphere_x = if hemisphere_vertical.z.abs() < 0.99999 {
+            Vector3::new(0.0, 0.0, 1.0).cross(&hemisphere_vertical).normalize()
+        } else {
+            Vector3::new(1.0, 0.0, 0.0).cross(&hemisphere_vertical).normalize()
         };
-        rand_dir_in_hemisphere = rand_dir_in_hemisphere/rand_dir_in_hemisphere.norm();
-        if dir.dot(&rand_dir_in_hemisphere) < 0.0 {
-            error!("Created ray is not in hemisphere");
-            panic!("Created ray is not in hemisphere");
-        }
-        trace!("Length of vector {}", rand_dir_in_hemisphere.norm());
+
+        let hemisphere_y = hemisphere_vertical.cross(&hemisphere_x);
+
+        let rand_dir_in_hemisphere = (polar.sin() * azimuthal.cos()) * hemisphere_x
+            + (polar.sin() * azimuthal.sin()) * hemisphere_y
+            + polar.cos() * hemisphere_vertical;
+
+        assert!(dir.dot(&rand_dir_in_hemisphere) >= 0.0);
         Self::new(
             base,
             rand_dir_in_hemisphere,
             n_bounces,
         )
     }
+
     /// Intersect ray with triangle
+    ///
+    /// (Möller–Trumbore intersection algorithm)
     ///
     /// Return:
     /// - scaling of ray t to intersection (>0)
     /// - scaling of vector between p0 and p1 (to intersection)
     /// - scaling of vector between p0 and p2 (to intersection)
-    fn intersect_triangle(&self, p0: &Vector3<f64>, p1: &Vector3<f64>, p2: &Vector3<f64>) -> Option<(f64, f64, f64)> {
+    fn intersect_triangle(
+        &self,
+        p0: &Vector3<f64>,
+        p1: &Vector3<f64>,
+        p2: &Vector3<f64>,
+    ) -> Option<(f64, f64, f64)> {
         info!("Intersecting ray with triangle");
         let s = self.base-p0;
         let e1 = p1-p0;
         let e2 = p2-p0;
-        let factor = 1.0/self.direction.cross(&e2).dot(&e1);
-        let t = factor*s.cross(&e1).dot(&e2);
-        let b1 = factor*self.direction.cross(&e2).dot(&s);
-        let b2 = factor*s.cross(&e1).dot(&self.direction);
-        if b1 >= 0.0 && b2 >= 0.0 && b1+b2 <= 1.0 && t > 0.0 {
-            // intersection
-            info!("Found intersection between ray and triangle");
-            return Some((t, b1, b2));
+        let h = self.direction.cross(&e2);
+        let det = e1.dot(&h);
+        if det.abs() < 1e-9 {
+            return None;
         }
-        info!("No intersection between ray and triangle found");
-        None
+
+        let inv_det = 1.0 / det;
+        let b1 = inv_det * s.dot(&h);
+        if !(0.0..=1.0).contains(&b1) {
+            return None;
+        }
+
+        let q = s.cross(&e1);
+        let b2 = inv_det * self.direction.dot(&q);
+        if b2 < 0.0 || b1 + b2 > 1.0 {
+            return None;
+        }
+
+        let t = inv_det * e2.dot(&q);
+        if t > 1e-9 {
+            info!("Found intersection between ray and triangle");
+            Some((t, b1, b2))
+        } else {
+            None
+        }
     }
+
     /// Intersect ray with (cubic, axis-aligned) bounding volume
     ///
     /// See: https://www.pbr-book.org/3ed-2018/Shapes/Basic_Shape_Interface#RayndashBoundsIntersections
@@ -175,7 +192,7 @@ pub struct ColorStack {
 impl ColorStack {
     fn new(dim_x: usize, dim_y: usize) -> Self {
         ColorStack {
-            accumulated_color: vec![vec![Vector3::zeros(); dim_x as usize]; dim_y as usize],
+            accumulated_color: vec![vec![Vector3::zeros(); dim_x]; dim_y],
             // height: vec![vec![Vector3::zeros(); dim_x as usize]; dim_y as usize],
         }
     }
@@ -223,13 +240,13 @@ impl AddAssign for ColorStack {
     }
 }
 
-impl std::convert::Into<image::ImageBuffer<image::Rgb::<u8>, Vec<u8>>> for ColorStack {
-    fn into(self) -> image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
-        if !self.accumulated_color.is_empty() {
+impl From<ColorStack> for image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    fn from(stack: ColorStack) -> Self {
+        if !stack.accumulated_color.is_empty() {
             // Create a new image buffer with resolution: res_x * res_y
-            let mut imgbuf = image::ImageBuffer::new(
-                self.accumulated_color[0].len().try_into().unwrap(),
-                self.accumulated_color.len().try_into().unwrap());
+            let mut imgbuf = Self::new(
+                stack.accumulated_color[0].len().try_into().unwrap(),
+                stack.accumulated_color.len().try_into().unwrap());
 
             // Populate the image buffer with the
             for (x, y, pixel) in imgbuf.enumerate_pixels_mut() {
@@ -241,17 +258,17 @@ impl std::convert::Into<image::ImageBuffer<image::Rgb::<u8>, Vec<u8>>> for Color
                 // let b = (color_stack.accumulated_color[y as usize][x as usize][2]/height_x_y_b) as u8;
                 // map colors
                 let scale = 30.0;
-                let r = self.accumulated_color[y as usize][x as usize][0]*scale;
+                let r = stack.accumulated_color[y as usize][x as usize][0]*scale;
                 let r = if r <= 255.0 {r as u8} else {255};
-                let g = self.accumulated_color[y as usize][x as usize][1]*scale;
+                let g = stack.accumulated_color[y as usize][x as usize][1]*scale;
                 let g = if g <= 255.0 {g as u8} else {255};
-                let b = self.accumulated_color[y as usize][x as usize][2]*scale;
+                let b = stack.accumulated_color[y as usize][x as usize][2]*scale;
                 let b = if b <= 255.0 {b as u8} else {255};
                 *pixel = image::Rgb([r, g, b]);
             }
             imgbuf
         } else {
-            image::ImageBuffer::default()
+            Self::default()
         }
     }
 }
@@ -268,15 +285,14 @@ impl ColorStack {
                 colorstack[pos.1][pos.0][1] as f32,
                 colorstack[pos.1][pos.0][2] as f32)
         });
-        let image = exr::prelude::Image::from_layer(
+        exr::prelude::Image::from_layer(
             exr::prelude::Layer::new(
                 (self.accumulated_color[0].len(), self.accumulated_color.len()),
                 exr::prelude::LayerAttributes::named("main-rgb-layer"),
                 exr::prelude::Encoding::UNCOMPRESSED,
                 channels
             )
-        );
-        image
+        )
     }
 }
 
@@ -312,6 +328,7 @@ impl ViewWindow {
             size,
         }
     }
+
     fn get_vector_from_center(&self, offset_horizontal: f64, offset_vertical: f64) -> Vector3<f64> {
         let horizontal = self.direction.cross(&Vector3::z_axis());
         let vertical = horizontal.cross(&self.direction);
@@ -365,6 +382,16 @@ impl ViewPoint {
 // }
 
 #[derive(Debug, Clone)]
+pub enum PathLength {
+    /// Fixed number of bounces
+    #[allow(dead_code)]
+    Fixed(u64),
+    /// (minimum_path_length, termination_probability)
+    #[allow(dead_code)]
+    Adaptive(u64, f64), // aka Russian Roulette.
+}
+
+#[derive(Debug, Clone)]
 pub struct Scene {
     view_point: ViewPoint,
     // /// Collection of all 3D veritces in the scene represented by Vector3<f64>
@@ -395,12 +422,13 @@ impl Scene {
             view_point: ViewPoint,
             models: Vec<tobj::Model>,
             materials: Vec<tobj::Material>,
+            from_graphical_coordinates: bool,
     ) -> Self {
         info!("Creating scene");
         let mut materials_extracted = Vec::new();
         for mat in materials {
             let [r, g, b] = mat.diffuse.unwrap();
-            if mat.name.contains("light_source") {
+            if mat.name.contains("light") || mat.name.contains("Light") {
                 let light_emission = Reflectance::from_vec(
                     Vec::from(mat.ambient.unwrap()).iter().map(|a| *a as f64).collect());
                 materials_extracted.push(Arc::new(objects::Material::DiffuseLightSource {
@@ -419,13 +447,22 @@ impl Scene {
         let mut triangles = Vec::new();
         let mut light_sources = Vec::new();
         for mdl in models {
+            debug!("Transferring: {:?}", mdl);
             let mut vertices_i = Vec::new();
             let mut normals_i = Vec::new();
             for vertex in mdl.mesh.positions.chunks(3) {
-                vertices_i.push(Arc::new(Vector3::new(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64)));
+                if from_graphical_coordinates {
+                    vertices_i.push(Arc::new(Vector3::new(vertex[0] as f64, vertex[2] as f64, vertex[1] as f64)));
+                } else {
+                    vertices_i.push(Arc::new(Vector3::new(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64)));
+                }
             }
             for normal in mdl.mesh.normals.chunks(3) {
-                normals_i.push(Arc::new(Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64)));
+                if from_graphical_coordinates {
+                    normals_i.push(Arc::new(Vector3::new(normal[0] as f64, normal[2] as f64, normal[1] as f64)));
+                } else {
+                    normals_i.push(Arc::new(Vector3::new(normal[0] as f64, normal[1] as f64, normal[2] as f64)));
+                }
             }
             for (vertex_indices, normal_indices) in mdl.mesh.indices.chunks(3)
             .zip(mdl.mesh.normal_indices.chunks(3)){
@@ -462,6 +499,9 @@ impl Scene {
             bbv_tree_root,
         }
     }
+
+    /// Get random light source. Uses uniform probability distribution for all light sources.
+    ///
     /// Currently does not support normal vector interpolation
     fn get_random_light_source(&self) -> (&objects::Triangle, f64) { // , reference_point: Vector3<f64>, triangle: objects::Triangle
         // todo check that light source is not selected from the same light source
@@ -485,6 +525,7 @@ impl Scene {
         let rndm_ls = &self.light_sources[rndm_ls_index];
         (rndm_ls, 1.0/self.light_sources.len() as f64)
     }
+
     /// Evaluate intersection according to path tracing with next event estimation
     ///
     /// Terminate rays after max_bounces bounces
@@ -492,7 +533,8 @@ impl Scene {
         &self,
         intersection: objects::Intersection,
         light_emission: bool,
-        max_bounces: u64,
+        backside_intersection: &BacksideIntersection,
+        max_bounces: &PathLength,
     ) -> Vector3<f64> {
         info!("Evaluating ray-scene-intersection: {intersection:?}, consider light emission: {light_emission}");
         // init intersection point
@@ -504,10 +546,39 @@ impl Scene {
         } else {
             None
         };
-        // check number of bounces
-        let lighting = if intersection.ray.n_bounces > max_bounces { // terminate ray
-            Vector3::new(0.0, 0.0, 0.0)
-        } else { // continue tracing ray
+        // check termination
+        let ray_weighting = match max_bounces {
+            PathLength::Fixed(termination_length) => {
+                if intersection.ray.n_bounces >= *termination_length { // terminate ray
+                    if let Some(randiance_emitted) = randiance_emitted {
+                        return randiance_emitted;
+                    } else {
+                        return Vector3::new(0.0, 0.0, 0.0);
+                    }
+                } else {
+                    1.0
+                }
+            },
+            PathLength::Adaptive(min_n_bounces, p_termination) => {
+                if intersection.ray.n_bounces < *min_n_bounces {
+                    1.0
+                } else {
+                    let rndm_number = utilities::random();
+                    if rndm_number > *p_termination {
+                        1./(1.-p_termination)
+                    } else { // terminate ray
+                        // println!("path len: {}", intersection.ray.n_bounces);
+                        if let Some(randiance_emitted) = randiance_emitted {
+                            return randiance_emitted;
+                        } else {
+                            return Vector3::new(0.0, 0.0, 0.0);
+                        }
+                    }
+                }
+            },
+        };
+        // continue tracing ray
+        let lighting = {
             // get face normal
             let face_normal = intersection.triangle.face_normal(&point_of_intersection);
             trace!("Face normal: {face_normal}");
@@ -515,24 +586,28 @@ impl Scene {
             let (ls, probability_ls) = self.get_random_light_source();
                 // &point_of_intersection,
                 // &intersection.triangle);
-            let (rndm_point_on_ls, ray_to_ls, area) = ls
+            let (rndm_point_on_ls, ray_to_ls, area, b1, b2) = ls
                 .random_point_on_surface(&point_of_intersection, intersection.ray.n_bounces);
-            let ls_intersection = Intersection {
-                ray: &ray_to_ls,
-                triangle: ls,
-                ray_scaling: (rndm_point_on_ls-point_of_intersection).norm(),
-            };
+            let ls_intersection = Intersection::new(
+                &ray_to_ls,
+                ls,
+                (rndm_point_on_ls-point_of_intersection).norm(),
+                b1,
+                b2,
+            );
             let ls_face_normal = ls.face_normal(&rndm_point_on_ls);
-            let randiance_direct = match self.trace_to_lightsource(&ray_to_ls, &ls_intersection){
+            let randiance_direct = match self.trace_to_lightsource(&ray_to_ls, &ls_intersection) {
                 Some(randiance_direct)
-                if ray_to_ls.direction.dot(&(face_normal/face_normal.norm())) > 0.0
-                && ray_to_ls.direction.dot(&(ls_face_normal/ls_face_normal.norm())) < 0.0 => {
+                if ray_to_ls.direction.dot(&(face_normal)) > 0.0
+                && ray_to_ls.direction.dot(&(ls_face_normal)) < 0.0 => {
+                    let p_density_on_ls = 1./area;
                     trace!("randiance from ls: {randiance_direct}");
-                    1.0/(probability_ls*1.0/area) // pdf
-                    *intersection.triangle.mat.brdf().component_mul(&randiance_direct) // brdf * radiance
+
+                    intersection.triangle.mat.brdf().component_mul(&randiance_direct) // brdf * radiance
                     *ray_to_ls.direction.dot(&(face_normal/face_normal.norm())) // cos(omega_i, normal_p)
-                    *(-ray_to_ls.direction.dot(&(ls_face_normal/ls_face_normal.norm()))) // cos(-omega_i, normal_x)
-                    /ls_intersection.ray_scaling.powi(2) // devision by r^2
+                    *(-ray_to_ls.direction.dot(&(ls_face_normal/ls_face_normal.norm()))) // cos(-omega_i, normal_vector_on_x)
+                    /(probability_ls*p_density_on_ls) // pdf: 1/(p_density_lightsource*p_projected_area)
+                    /ls_intersection.ray_scaling.powi(2)
                 },
                 _ => {
                     Vector3::new(0.0, 0.0, 0.0)
@@ -549,6 +624,7 @@ impl Scene {
             let randiance_indirect = match self.trace(
                     &ray_refl,
                     false,
+                    backside_intersection,
                     max_bounces){
                 Some(randiance_indirect) => {
                     1.0/ray_refl.direction.dot(&(face_normal/face_normal.norm())) // pdf
@@ -566,26 +642,13 @@ impl Scene {
         // combine lighting and randiance_emitted
         if let Some(randiance_emitted) = randiance_emitted {
             debug!("Ray-scene-intersection evaluated: radiance = {}", randiance_emitted + lighting);
-            randiance_emitted + lighting
+            ray_weighting*(randiance_emitted + lighting)
         } else {
             debug!("Ray-scene-intersection evaluated: radiance = {}", lighting);
-            lighting
+            ray_weighting*lighting
         }
     }
-    /// Trace ray into the scene
-    ///
-    /// Intersect ray with the scene, split ray according to stratification rules and evaluate intersections with scene.
-    fn trace(&self, ray: &Ray, eval_light_emission: bool, max_bounces: u64) -> Option<Vector3<f64>> {
-        info!("Tracing ray: {ray:?}");
-        // determine first intersection with an object and evaluate it in case it exists
-        if let Some(intersec) = self.bbv_tree_root.intersect(ray) {
-            return Some(self.eval_intersection(
-                intersec,
-                eval_light_emission,
-                max_bounces));
-        }
-        None
-    }
+
     fn trace_to_lightsource(&self, ray: &Ray, intersection: &objects::Intersection) -> Option<Vector3<f64>> {
         info!("Tracing ray to light source: {ray:?}");
         // check if lightsource is concealed by other object
@@ -598,6 +661,45 @@ impl Scene {
             Some(intersection.triangle.mat.light_emission())
         }
     }
+
+    /// Trace ray into the scene
+    ///
+    /// Intersect ray with the scene, split ray according to stratification rules and evaluate intersections with scene.
+    fn trace(
+        &self,
+        ray: &Ray,
+        eval_light_emission: bool,
+        backside_intersection: &BacksideIntersection,
+        max_bounces: &PathLength,
+    ) -> Option<Vector3<f64>> {
+        info!("Tracing ray: {ray:?}");
+        // determine first intersection with an object and evaluate it in case it exists
+        if let Some(intersec) = self.bbv_tree_root.intersect(ray, backside_intersection) {
+            match backside_intersection {
+                BacksideIntersection::Ignore => {
+                    return Some(self.eval_intersection(
+                        intersec,
+                        eval_light_emission,
+                        backside_intersection,
+                        max_bounces,
+                    ));
+                },
+                BacksideIntersection::EndRay => {
+                    if intersec.from_front() {
+                        return Some(self.eval_intersection(
+                            intersec,
+                            eval_light_emission,
+                            backside_intersection,
+                            max_bounces,
+                        ));
+                    }
+                },
+            }
+
+        }
+        None
+    }
+
     fn trace_rays_in_tile(
         transmitter: &mut crossbeam::channel::Sender<ColorStack>,
         scene: Arc<Self>,
@@ -608,7 +710,8 @@ impl Scene {
         res_y: usize,
         // rays_numbered: std::ops::Range<u64>,
         n_rays_per_pixel: u64,
-        max_bounces: u64,
+        backside_intersection: BacksideIntersection,
+        max_bounces: PathLength,
         bar: Arc<ProgressBar>,
     ) {
         info!("Tracing tile {tile:?} in new thread");
@@ -625,7 +728,12 @@ impl Scene {
                     debug!("Created ray: {ray:?}");
 
                     // intersect ray with scene objects and eval intersections
-                    if let Some(ray_data) = scene.trace(&ray, true, max_bounces) {
+                    if let Some(ray_data) = scene.trace(
+                        &ray,
+                        true,
+                        &backside_intersection,
+                        &max_bounces,
+                    ) {
                         color_stack.accumulated_color[pixel_y][pixel_x] += ray_data;
                     }
                 }
@@ -670,7 +778,8 @@ impl Scene {
         res_x: usize,
         res_y: usize,
         n_rays_per_pixel: u64,
-        max_bounces: u64,
+        backside_intersection: BacksideIntersection,
+        max_bounces: PathLength,
         channel_bound: usize,
         tile_size: usize,
     ) -> ColorStack {
@@ -717,15 +826,16 @@ impl Scene {
                 res_x,
                 res_y,
                 n_rays_per_pixel,
-                max_bounces,
+                backside_intersection.clone(),
+                max_bounces.clone(),
                 bar);
         });
 
         let total_color_stack = handle.join().unwrap();
 
         // multi_p_bar..clear().unwrap();
-        println!("Finished evaluating {} rays in {}", (res_x as u64)*(res_y as u64)*n_rays_per_pixel, started.elapsed().as_millis());
-        println!("Finished... ");
+        println!("Finished evaluating {} rays in {} s", (res_x as u64)*(res_y as u64)*n_rays_per_pixel, started.elapsed().as_secs_f32());
+        // println!("Finished... ");
 
         total_color_stack
     }

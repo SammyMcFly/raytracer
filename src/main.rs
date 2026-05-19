@@ -4,6 +4,7 @@
 //!
 //!
 use clap::Parser;
+use rtcore::{PathLength, objects::BacksideIntersection};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::FmtSubscriber;
 use tracing::info; // , error, info, span, trace, warn, debug};
@@ -22,8 +23,11 @@ mod rtcore;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// File path to input .obj file
-    #[arg(short, long, default_value = "./test_scene.obj")]
+    /// File path to input .obj file with paired .mtl file
+    ///
+    /// Only triangulated object are supported, .mtl file needs to contain a material called: light or Light,
+    /// which will be used as light source
+    #[arg(short, long, default_value = "./cornell-box.obj")]
     object: String,
     // /// Horizontal resolution
     // /// Vertical resolution
@@ -76,29 +80,77 @@ fn main() -> Result<(), Error>{
         Err(_) => { println!("Failed to load MTL file"); None },
     };
 
+
+
+    // SETTINS
+
     // create scene
+    // let window = rtcore::ViewWindow::from(
+    //     Vector3::from([1.0, 1.0, -1.0]),
+    //     (16.0/8.0, 9.0/8.0));
+
+    // let view_point = rtcore::ViewPoint {
+    //     point: Vector3::from([-8.0, -8.0, 8.0]),
+    //     window,
+    //     distance_to_window_plane: 2.0,
+    // };
+    // const FROM_GRAPHICAL_COORDINATES: bool = false;
+
     let window = rtcore::ViewWindow::from(
-        Vector3::from([1.0, 1.0, -1.0]),
+        Vector3::from([0.0, -10.0, -1.0]),
         (16.0/8.0, 9.0/8.0));
 
     let view_point = rtcore::ViewPoint {
-        point: Vector3::from([-8.0, -8.0, 8.0]),
+        point: Vector3::from([0.0, 10.0, 3.7]),
         window,
         distance_to_window_plane: 2.0,
     };
-    let scene1 = rtcore::Scene::from(view_point, models, materials.unwrap());
+    const FROM_GRAPHICAL_COORDINATES: bool = true;
+
+    // let window = rtcore::ViewWindow::from(
+    //     Vector3::from([-1.0, 0.0, -0.01]),
+    //     (16.0/8.0, 9.0/8.0));
+
+    // let view_point = rtcore::ViewPoint {
+    //     point: Vector3::from([17.0, 0.0, 2.5]),
+    //     window,
+    //     distance_to_window_plane: 2.0,
+    // };
+    // const FROM_GRAPHICAL_COORDINATES: bool = false;
 
     // init img properties
-    let imgx = 2560;
-    let imgy = 1440;
-    let max_bounces = 10;
+    const IMGX: usize = 2560;
+    const IMGY: usize = 1440;
     // let n_rays = 1E9 as u64;
-    let n_rays_per_pixel = 100;
-    let channel_bound: usize = 12; // number of cores is a good choice
-    let tile_size = 110;
+    const N_RAYS_PER_PIXEL: u64 = 100;
+    const CHANNEL_BOUND: usize = 12; // number of cores is a good choice
+    const TILE_SIZE: usize = 110;
+
+    // const PATH_LENGTH: PathLength = PathLength::Fixed(1);
+    const PATH_LENGTH: PathLength = PathLength::Adaptive(1, 0.2);
+
+    const BACKSIDE_INTERSECTIONS: BacksideIntersection = BacksideIntersection::Ignore;
+
+
+
+    // Render
+
+    let scene1 = rtcore::Scene::from(
+        view_point,
+        models,
+        materials.unwrap(),
+        FROM_GRAPHICAL_COORDINATES,
+    );
 
     // take look into scene
-    let colorstack = scene1.look(imgx, imgy, n_rays_per_pixel, max_bounces, channel_bound, tile_size);
+    let colorstack = scene1.look(
+        IMGX,
+        IMGY,
+        N_RAYS_PER_PIXEL,
+        BACKSIDE_INTERSECTIONS,
+        PATH_LENGTH,
+        CHANNEL_BOUND,
+        TILE_SIZE);
 
     // Write data to .png file
     // let _png: image::ImageBuffer<image::Rgb::<u8>, Vec<u8>> = colorstack.into();
