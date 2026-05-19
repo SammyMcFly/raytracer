@@ -1,11 +1,10 @@
-//! Core of Rusty Ray Tracer
-//!
-//! All the most important structs, methods and functions that Rusty Ray Tracer builds on are defined here
-//!
-//! This ray tracer builds on the concept of path tracing with next event estimation:
-//! - stratification of incoming radiance domain into light sources and indirect lighting (whole hemisphere)
-//! -
-//!
+/// Core of Rusty Ray Tracer
+///
+/// All the most important structs, methods and functions that Rusty Ray Tracer builds on are defined here
+///
+/// This ray tracer builds on the concept of path tracing with next event estimation:
+/// - stratification of incoming radiance domain into light sources and indirect lighting (whole hemisphere)
+/// - importance sampling into hemisphere
 use objects::{BBVTNode, Intersection, Reflectance};
 use tracing::{debug, info, trace}; // debug, error, info, span, trace, warn};
 use indicatif::{MultiProgress, ProgressBar};
@@ -63,8 +62,12 @@ impl Ray {
     /// Construct new Ray from base into hemisphere defined by dir
     ///
     /// Direction is random and weighted according to "weighting"
-    pub fn new_into_hemisphere(base: Vector3<f64>, dir: Vector3<f64>,
-            n_bounces: u64, weighting: SampleWeighting) -> Ray {
+    pub fn new_into_hemisphere(
+        base: Vector3<f64>,
+        dir: Vector3<f64>,
+        n_bounces: u64,
+        weighting: SampleWeighting,
+    ) -> Ray {
         info!("Creating new ray with random direction inside the hemisphere");
         let azimuthal = utilities::random()*2.0*consts::PI;
         // polar angle is not equally distributed over its range (distribution: sin(theta))
@@ -528,7 +531,7 @@ impl Scene {
 
     /// Evaluate intersection according to path tracing with next event estimation
     ///
-    /// Terminate rays after max_bounces bounces
+    /// Terminate rays after max_bounces bounces or statistically
     fn eval_intersection(
         &self,
         intersection: objects::Intersection,

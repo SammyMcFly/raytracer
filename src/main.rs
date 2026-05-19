@@ -1,8 +1,7 @@
-//! Rusty ray tracer
-//!
-//! Simple ray tracer that supports loading .obj files and rendering into a .png file
-//!
-//!
+/// Rusty ray tracer
+///
+/// Simple ray tracer that supports loading .obj files and rendering into a .png file
+///
 use clap::Parser;
 use rtcore::{PathLength, objects::BacksideIntersection};
 use tracing::level_filters::LevelFilter;
