@@ -27,12 +27,18 @@ struct Args {
     /// which will be used as light source
     #[arg(short, long, default_value = "./cornell-box.obj")]
     object: String,
-    /// Assume graphical coordinates when importing scene from .obj file (y-axis is vertical)
-    #[arg(short, long, default_value_t = true)]
-    graphical_coordinates: bool,
+    /// Assume mathematical axis orientation for coordinates in .obj file (vertical z-axis)
+    #[arg(short = 'g', long,)]
+    no_graphical_coordinates: bool,
     /// Rendering configuration
     #[arg(short, long, default_value = "./rendering.toml")]
     config: String,
+    /// Output file format (Options: exr, png)
+    #[arg(short, long, default_value = "exr")]
+    format: String,
+    /// Output file name (without extension)
+    #[arg(short = 'n', long, default_value = "rendering")]
+    output_name: String,
     /// Log severity level (Options: TRACE, DEBUG, INFO, WARN, ERROR, OFF)
     #[arg(short, long, default_value_t=String::from("OFF"))]
     log: String,
@@ -118,7 +124,7 @@ fn main() -> Result<(), Error>{
         view_point,
         models,
         materials.unwrap(),
-        args.graphical_coordinates,
+        !args.no_graphical_coordinates,
     );
 
     // take look into scene
@@ -131,14 +137,17 @@ fn main() -> Result<(), Error>{
         config.render.channel_bound,
         config.render.tile_size);
 
-    // Write data to .png file
-    // let _png: image::ImageBuffer<image::Rgb::<u8>, Vec<u8>> = colorstack.into();
-    // _png.save("rendering.png").unwrap();
-
-    // Write data to .exr file
-    let _exr = colorstack.into_exr();
-    _exr.write()
-        .to_file("rendering.exr").unwrap();
+    // Write data to file
+    match args.format.as_str() {
+        "png" => {
+            let png: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> = colorstack.into();
+            png.save(format!("{}.png", args.output_name)).unwrap();
+        },
+        _ => {
+            let exr = colorstack.into_exr();
+            exr.write().to_file(format!("{}.png", args.output_name)).unwrap();
+        },
+    }
 
     Ok(())
 }
