@@ -178,6 +178,6 @@ termination_probability = 0.2
 - Specular and glossy materials are defined but not yet fully implemented (fallback to diffuse BRDF).
 - Normal interpolation (`face_normal` for non-flat shading) has a known issue and falls back to flat normals when vertex normals differ.
 
-## License
+<!-- ## License
 
-*Add your license here.*
+*Add your license here.* -->
