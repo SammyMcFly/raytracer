@@ -3,20 +3,19 @@
 /// Simple ray tracer that supports loading .obj files and rendering into a .png file
 ///
 use clap::Parser;
-use rtcore::{PathLength, objects::BacksideIntersection};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::FmtSubscriber;
-use tracing::info; // , error, info, span, trace, warn, debug};
-
+use tracing::info; // , error, info, span, trace, warn, debug}
 use nalgebra::Vector3;
-
 use exr::prelude::WritableImage;
-
 use std::io::Error;
+use std::fs;
 
 mod rtcore;
+mod config;
 
-
+use rtcore::{PathLength, objects::BacksideIntersection};
+use config::{Config, PathLengthConfig};
 
 /// Simple ray tracer that supports loading .obj files and rendering into a .png file
 #[derive(Parser, Debug)]
@@ -28,8 +27,12 @@ struct Args {
     /// which will be used as light source
     #[arg(short, long, default_value = "./cornell-box.obj")]
     object: String,
-    // /// Horizontal resolution
-    // /// Vertical resolution
+    /// Assume graphical coordinates when importing scene from .obj file (y-axis is vertical)
+    #[arg(short, long, default_value_t = true)]
+    graphical_coordinates: bool,
+    /// Rendering configuration
+    #[arg(short, long, default_value = "./rendering.toml")]
+    config: String,
     /// Log severity level (Options: TRACE, DEBUG, INFO, WARN, ERROR, OFF)
     #[arg(short, long, default_value_t=String::from("OFF"))]
     log: String,
@@ -79,58 +82,35 @@ fn main() -> Result<(), Error>{
         Err(_) => { println!("Failed to load MTL file"); None },
     };
 
+    // Load config
+    let config_str = fs::read_to_string(&args.config)
+        .expect("Failed to read config file");
+    let config: Config = toml::from_str(&config_str)
+        .expect("Failed to parse config file");
 
-
-    // SETTINS
-
-    // create scene
-    // let window = rtcore::ViewWindow::from(
-    //     Vector3::from([1.0, 1.0, -1.0]),
-    //     (16.0/8.0, 9.0/8.0));
-
-    // let view_point = rtcore::ViewPoint {
-    //     point: Vector3::from([-8.0, -8.0, 8.0]),
-    //     window,
-    //     distance_to_window_plane: 2.0,
-    // };
-    // const FROM_GRAPHICAL_COORDINATES: bool = false;
-
+    // Build scene parameters from config
     let window = rtcore::ViewWindow::from(
-        Vector3::from([0.0, -10.0, -1.0]),
-        (16.0/8.0, 9.0/8.0));
+        Vector3::from(config.camera.view_direction),
+        (config.camera.window_size[0], config.camera.window_size[1]),
+    );
 
     let view_point = rtcore::ViewPoint {
-        point: Vector3::from([0.0, 10.0, 3.7]),
+        point: Vector3::from(config.camera.position),
         window,
-        distance_to_window_plane: 2.0,
+        distance_to_window_plane: config.camera.focal_distance,
     };
-    const FROM_GRAPHICAL_COORDINATES: bool = true;
 
-    // let window = rtcore::ViewWindow::from(
-    //     Vector3::from([-1.0, 0.0, -0.01]),
-    //     (16.0/8.0, 9.0/8.0));
+    let path_length: PathLength = match config.render.path_length {
+        PathLengthConfig::Fixed { max_bounces } => rtcore::PathLength::Fixed { max_bounces },
+        PathLengthConfig::Adaptive { min_bounces, termination_probability } => {
+            rtcore::PathLength::Adaptive { min_bounces, termination_probability }
+        },
+    };
 
-    // let view_point = rtcore::ViewPoint {
-    //     point: Vector3::from([17.0, 0.0, 2.5]),
-    //     window,
-    //     distance_to_window_plane: 2.0,
-    // };
-    // const FROM_GRAPHICAL_COORDINATES: bool = false;
-
-    // init img properties
-    const IMGX: usize = 2560;
-    const IMGY: usize = 1440;
-    // let n_rays = 1E9 as u64;
-    const N_RAYS_PER_PIXEL: u64 = 100;
-    const CHANNEL_BOUND: usize = 12; // number of cores is a good choice
-    const TILE_SIZE: usize = 110;
-
-    // const PATH_LENGTH: PathLength = PathLength::Fixed(1);
-    const PATH_LENGTH: PathLength = PathLength::Adaptive(1, 0.2);
-
-    const BACKSIDE_INTERSECTIONS: BacksideIntersection = BacksideIntersection::Ignore;
-
-
+    let backside_intersections = match config.render.backside_intersections.as_str() {
+        "end_ray" => BacksideIntersection::EndRay,
+        _ => BacksideIntersection::Ignore,
+    };
 
     // Render
 
@@ -138,18 +118,18 @@ fn main() -> Result<(), Error>{
         view_point,
         models,
         materials.unwrap(),
-        FROM_GRAPHICAL_COORDINATES,
+        args.graphical_coordinates,
     );
 
     // take look into scene
     let colorstack = scene1.look(
-        IMGX,
-        IMGY,
-        N_RAYS_PER_PIXEL,
-        BACKSIDE_INTERSECTIONS,
-        PATH_LENGTH,
-        CHANNEL_BOUND,
-        TILE_SIZE);
+        config.render.width,
+        config.render.height,
+        config.render.rays_per_pixel,
+        backside_intersections,
+        path_length,
+        config.render.channel_bound,
+        config.render.tile_size);
 
     // Write data to .png file
     // let _png: image::ImageBuffer<image::Rgb::<u8>, Vec<u8>> = colorstack.into();

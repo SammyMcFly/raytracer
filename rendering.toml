@@ -1,0 +1,22 @@
+[camera]
+position = [0.0, 10.0, 3.7]
+view_direction = [0.0, -10.0, -1.0]
+focal_distance = 2.0
+window_size = [2.0, 1.125]
+
+[render]
+width = 2560
+height = 1440
+rays_per_pixel = 100
+tile_size = 110
+channel_bound = 12
+backside_intersections = "ignore" # "ignore" or "end_ray"
+
+[render.path_length]
+mode = "adaptive"
+min_bounces = 1
+termination_probability = 0.2
+
+# [render.path_length]
+# mode = "fixed"
+# max_bounces = 5

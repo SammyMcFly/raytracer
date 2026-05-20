@@ -388,10 +388,15 @@ impl ViewPoint {
 pub enum PathLength {
     /// Fixed number of bounces
     #[allow(dead_code)]
-    Fixed(u64),
+    Fixed{
+        max_bounces: u64,
+    },
     /// (minimum_path_length, termination_probability)
     #[allow(dead_code)]
-    Adaptive(u64, f64), // aka Russian Roulette.
+    Adaptive{
+        min_bounces: u64,
+        termination_probability: f64,
+    }, // aka Russian Roulette.
 }
 
 #[derive(Debug, Clone)]
@@ -551,8 +556,8 @@ impl Scene {
         };
         // check termination
         let ray_weighting = match max_bounces {
-            PathLength::Fixed(termination_length) => {
-                if intersection.ray.n_bounces >= *termination_length { // terminate ray
+            PathLength::Fixed{max_bounces} => {
+                if intersection.ray.n_bounces >= *max_bounces { // terminate ray
                     if let Some(randiance_emitted) = randiance_emitted {
                         return randiance_emitted;
                     } else {
@@ -562,13 +567,13 @@ impl Scene {
                     1.0
                 }
             },
-            PathLength::Adaptive(min_n_bounces, p_termination) => {
-                if intersection.ray.n_bounces < *min_n_bounces {
+            PathLength::Adaptive{min_bounces, termination_probability} => {
+                if intersection.ray.n_bounces < *min_bounces {
                     1.0
                 } else {
                     let rndm_number = utilities::random();
-                    if rndm_number > *p_termination {
-                        1./(1.-p_termination)
+                    if rndm_number > *termination_probability {
+                        1./(1.-*termination_probability)
                     } else { // terminate ray
                         // println!("path len: {}", intersection.ray.n_bounces);
                         if let Some(randiance_emitted) = randiance_emitted {
